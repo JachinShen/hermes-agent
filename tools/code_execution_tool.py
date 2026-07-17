@@ -694,17 +694,21 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _creation_locks, _creation_locks_lock,
+        _resolve_container_task_id, apply_task_env_overrides,
+        resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
+    overrides = resolve_task_overrides(task_id)
+    config = apply_task_env_overrides(_get_env_config(), overrides)
+    env_type = config["env_type"]
 
     # Fast path: environment already exists
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            return _active_environments[effective_task_id], env_type
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -716,11 +720,7 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
-
-        config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+                return _active_environments[effective_task_id], env_type
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -755,6 +755,7 @@ def _get_or_create_env(task_id: str):
                 "port": config.get("ssh_port", 22),
                 "key": config.get("ssh_key", ""),
                 "persistent": config.get("ssh_persistent", False),
+                "sync_hermes_home": config.get("ssh_sync_hermes_home", True),
             }
 
         local_config = None

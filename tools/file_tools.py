@@ -948,6 +948,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_container_task_id,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        apply_task_env_overrides,
     )
     import time
 
@@ -999,8 +1000,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             from tools.terminal_tool import resolve_task_overrides
 
             config = _get_env_config()
-            env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
+            config = apply_task_env_overrides(config, overrides)
+            env_type = config["env_type"]
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -1063,6 +1065,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "port": config.get("ssh_port", 22),
                     "key": config.get("ssh_key", ""),
                     "persistent": config.get("ssh_persistent", False),
+                    "sync_hermes_home": config.get("ssh_sync_hermes_home", True),
                 }
 
             local_config = None

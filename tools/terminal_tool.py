@@ -1227,6 +1227,30 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     )
 
 
+_TASK_ENV_CONFIG_KEYS = frozenset({
+    "env_type", "cwd",
+    "docker_image", "singularity_image", "modal_image", "daytona_image",
+    "ssh_host", "ssh_user", "ssh_port", "ssh_key", "ssh_persistent",
+    "ssh_sync_hermes_home",
+})
+
+
+def apply_task_env_overrides(
+    config: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return terminal config with safe per-task environment keys applied.
+
+    ``env_type`` was already an isolation signal, but environment creation used
+    to ignore it and keep reading the process-global backend. Session-selectable
+    backends require the override to select SSH without mutating TERMINAL_ENV.
+    """
+    effective = dict(config)
+    for key in _TASK_ENV_CONFIG_KEYS:
+        if key in overrides:
+            effective[key] = overrides[key]
+    return effective
+
+
 # Configuration from environment variables
 
 def _parse_env_var(name: str, default: str, converter: Any = int, type_label: str = "integer"):
@@ -1624,6 +1648,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             key_path=ssh_config.get("key", ""),
             cwd=cwd,
             timeout=timeout,
+            sync_hermes_home=ssh_config.get("sync_hermes_home", True),
         )
 
     else:
@@ -2153,9 +2178,9 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Get configuration
+        # Get configuration and apply the selected task/backend override without
+        # mutating process-global TERMINAL_ENV.
         config = _get_env_config()
-        env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -2170,6 +2195,8 @@ def terminal_tool(
         # ``"default"``) is still found under its originating session id while
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
+        config = apply_task_env_overrides(config, overrides)
+        env_type = config["env_type"]
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -2286,6 +2313,7 @@ def terminal_tool(
                                 "port": config.get("ssh_port", 22),
                                 "key": config.get("ssh_key", ""),
                                 "persistent": config.get("ssh_persistent", False),
+                                "sync_hermes_home": config.get("ssh_sync_hermes_home", True),
                             }
 
                         container_config = None
