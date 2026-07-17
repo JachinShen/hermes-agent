@@ -1776,6 +1776,47 @@ class ProcessRegistry:
             result.append(entry)
         return result
 
+    # ----- Backend lifecycle (for execution_backends delete) -----
+
+    def retire_backend(self, backend_id: str) -> int:
+        """Mark all running sessions owned by *backend_id* as exited.
+
+        Iterates the running-process map for sessions whose ``backend_id``
+        matches *backend_id*, marks them ``exited`` with exit_code ``None``
+        and completion_reason ``backend_lost``, then moves them to finished.
+        Does NOT send SSH kill signals — the workspace was already stopped
+        by the caller (adapter.workspace-stop) or will be stopped after this
+        call returns.
+
+        The finished list retains the original ``backend_id`` so callers
+        that read the process list can still see which backend owned each
+        retired session.
+
+        Returns the number of sessions that were retired.
+        """
+        retired = 0
+        with self._lock:
+            target_ids = [
+                sid
+                for sid, s in list(self._running.items())
+                if hasattr(s, "backend_id") and s.backend_id == backend_id
+                and not s.exited
+            ]
+        for sid in target_ids:
+            session = self.get(sid)
+            if session is None:
+                continue
+            with session._lock:
+                if session.exited:
+                    continue
+                session.exited = True
+                session.exit_code = None
+                session.completion_reason = "backend_lost"
+                session.termination_source = "backend.delete"
+            self._move_to_finished(session)
+            retired += 1
+        return retired
+
     # ----- Session/Task Queries (for gateway integration) -----
 
     def has_active_processes(self, task_id: str) -> bool:

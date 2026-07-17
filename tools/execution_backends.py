@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import shlex
 import sqlite3
@@ -21,6 +22,8 @@ from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from hermes_cli.config import get_hermes_home, load_config
+
+logger = logging.getLogger(__name__)
 
 
 CNB_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -786,9 +789,54 @@ def backend_tool(
     if action == "delete":
         backend_id = _validate_backend_id(backend_id)
         record = backend_store.get_backend(backend_id)
+
+        # Step 1: fail-closed — set status to ``deleting`` so concurrent
+        # routing attempts (get_current) raise BackendError instead of
+        # routing to a vanishing workspace.
+        original_status = record.status
+        backend_store.update_backend_status(backend_id, "deleting")
+
+        # Step 2: stop the remote workspace.  On failure, restore the
+        # original status so routing is unblocked, then re-raise — the
+        # DB record, bindings, overrides, and env are fully preserved.
         if record.driver == "cnb":
-            cnb.stop_backend(record)
+            try:
+                cnb.stop_backend(record)
+            except Exception:
+                backend_store.update_backend_status(
+                    backend_id, original_status
+                )
+                raise
+
+        # Step 3: retire this backend's processes in the registry.
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.retire_backend(backend_id)
+        except Exception:
+            logger.exception(
+                "Failed to retire processes for backend %s", backend_id
+            )
+
+        # Step 4: clean up in-memory terminal_tool state for ALL
+        # execution keys that match this backend (old format
+        # ``execution-backend:<id>`` and new format
+        # ``execution-backend:<id>:session:<hash>``).
+        try:
+            from tools.terminal_tool import (
+                clear_backend_execution_env,
+            )
+
+            clear_backend_execution_env(backend_id)
+        except Exception:
+            logger.exception(
+                "Failed to clear execution env for backend %s",
+                backend_id,
+            )
+
+        # Step 5: delete from DB — bindings, events, and the record itself.
         backend_store.delete_backend(backend_id)
+
         return _backend_result(
             action=action,
             session_key=session_key,

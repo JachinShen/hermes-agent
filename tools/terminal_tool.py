@@ -1177,6 +1177,116 @@ def clear_task_env_overrides(task_id: str):
     clear_session_cwd(task_id)
 
 
+# Prefix used by ``resolve_execution_task_id`` and older code.
+_EXECUTION_BACKEND_PREFIX = "execution-backend:"
+
+
+def _execution_backend_keys(backend_id: str) -> list[str]:
+    """Return all ``_task_env_overrides`` / ``_active_environments`` keys
+    that match *backend_id*, handling both the old flat key format
+    ``execution-backend:<backend_id>`` and the new session-scoped format
+    ``execution-backend:<backend_id>:session:<hash>``.
+
+    Uses a strict suffix/segment check to **avoid** matching a shorter
+    backend_id that happens to be a prefix of another (e.g. ``cnb-a``
+    must not match ``cnb-aa`` or ``cnb-ab``).
+    """
+    matched: list[str] = []
+    # Scan both tracking dicts (same keys are used in both).
+    all_keys: set[str] = set()
+    with _task_env_overrides_lock:
+        all_keys.update(_task_env_overrides.keys())
+    with _env_lock:
+        all_keys.update(_active_environments.keys())
+    with _session_cwd_lock:
+        all_keys.update(_session_cwd.keys())
+
+    for key in all_keys:
+        if not key.startswith(_EXECUTION_BACKEND_PREFIX):
+            continue
+        # Strip the prefix to get ``<backend-id>[:session:<hash>]``.
+        remainder = key[len(_EXECUTION_BACKEND_PREFIX):]
+        colon = remainder.find(":")
+        if colon == -1:
+            # Old format: ``<backend-id>`` — exact match only.
+            if remainder == backend_id:
+                matched.append(key)
+        else:
+            # New format: ``<backend-id>:session:<hash>`` — match the
+            # backend-id segment exactly.
+            if remainder[:colon] == backend_id:
+                matched.append(key)
+
+    return matched
+
+
+def clear_backend_execution_env(backend_id: str) -> int:
+    """Clean up all in-memory state associated with *backend_id*.
+
+    Removes entries from ``_task_env_overrides``, ``_active_environments``,
+    ``_last_activity``, ``_creation_locks``, and ``_session_cwd`` for every
+    execution key (old format ``execution-backend:<id>`` and new format
+    ``execution-backend:<id>:session:<hash>``) that belongs to this backend.
+
+    Collects the environment references, removes them from the memory maps
+    FIRST (inside their respective locks), then stops/cleanups the actual
+    sandbox processes OUTSIDE the locks so concurrent tool calls are not
+    blocked by potentially slow Docker/Modal/SSH teardown.
+
+    ``file_ops`` cache for each matched key is also invalidated.
+
+    Returns the number of keys that were cleaned up.
+    """
+    matched_keys = _execution_backend_keys(backend_id)
+
+    # Phase 1: remove from memory maps (inside locks).  Must happen even
+    # if subsequent stop/cleanup throws.
+    envs_to_stop: list[tuple[str, Any]] = []
+    with _task_env_overrides_lock:
+        for key in matched_keys:
+            _task_env_overrides.pop(key, None)
+
+    with _env_lock:
+        for key in matched_keys:
+            env = _active_environments.pop(key, None)
+            _last_activity.pop(key, None)
+            if env is not None:
+                envs_to_stop.append((key, env))
+
+    with _creation_locks_lock:
+        for key in matched_keys:
+            _creation_locks.pop(key, None)
+
+    for key in matched_keys:
+        clear_session_cwd(key)
+
+    # Phase 2: invalidate file_ops cache (lock-free call).
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        for key in matched_keys:
+            clear_file_ops_cache(key)
+    except Exception:
+        logger.exception("Failed to clear file_ops cache during backend env cleanup")
+
+    # Phase 3: stop/cleanup/terminate actual environments OUTSIDE locks.
+    for _key, env in envs_to_stop:
+        try:
+            if hasattr(env, "cleanup"):
+                env.cleanup()
+            elif hasattr(env, "stop"):
+                env.stop()
+            elif hasattr(env, "terminate"):
+                env.terminate()
+        except Exception:
+            logger.exception(
+                "Best-effort cleanup failed for env of backend %s",
+                backend_id,
+            )
+
+    return len(matched_keys)
+
+
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     Map a tool-call ``task_id`` to the container/sandbox key used by
