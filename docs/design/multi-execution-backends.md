@@ -2,27 +2,52 @@
 
 ## Status
 
-This document defines an incremental design for keeping the Hermes control plane local while routing environment tools to one local backend or one of several CNB workspaces.
-
-The first implementation milestone covers the local registry, per-session binding, deterministic routing key, CNB CLI adapter contract, lifecycle deadline calculation, and behavior tests. Background lifecycle delivery and a live CNB end-to-end test are follow-up gates rather than prerequisites for the local control-plane seam.
+This document describes the final implementation of multi-execution backends in
+Hermes Agent. The Hermes control plane (conversation history, prompts, LLM
+requests, provider credentials, memory, skills, scheduling, delivery) stays
+local; environment tools (terminal, process, file I/O) are routed to one local
+backend or one of several CNB workspaces.
 
 ## Goals
 
-1. Keep conversation history, prompts, LLM requests, provider credentials, memory, skills, scheduling, and delivery on the local Hermes host.
+1. Keep conversation history, prompts, LLM requests, provider credentials,
+   memory, skills, scheduling, and delivery on the local Hermes host.
 2. Let one Hermes profile manage `local + N` CNB execution backends.
-3. Let each conversation select its current execution backend without rebuilding the system prompt or invalidating prompt caching.
+3. Let each conversation select its current execution backend without rebuilding
+   the system prompt or invalidating prompt caching.
 4. Route all environment-sensitive tools consistently.
-5. Keep remote workspace persistence explicit: Git is the cross-backend code transport.
-6. Reuse Hermes's existing environment abstraction instead of creating a second terminal/file execution stack.
+5. Keep remote workspace persistence explicit: Git is the cross-backend code
+   transport.
+6. Reuse Hermes's existing environment abstraction instead of creating a second
+   terminal/file execution stack.
 
 ## Non-goals
 
 - Running the Hermes agent loop or LLM client inside CNB.
-- Synchronizing local `HERMES_HOME`, memory, skills, credentials, or conversation state into CNB.
+- Synchronizing local `HERMES_HOME`, memory, skills, credentials, or
+  conversation state into CNB.
 - Automatically committing, pushing, restoring, or merging Git work.
 - Silently falling back to `local` when a CNB backend is unavailable.
 - Automatically replaying a failed command on another backend.
 - Treating SSH connectivity as CNB's documented workspace heartbeat.
+
+## Enablement
+
+The feature is **off by default** and must be explicitly enabled in
+`config.yaml`:
+
+```yaml
+execution_backends:
+  enabled: true
+```
+
+When disabled, `backend` tool is not registered and
+`maybe_resolve_execution_task_id` returns the original `task_id` unchanged for
+all environment tools.
+
+The `backend` tool registers only when `execution_backends.enabled` is `true`.
+Additionally, the official `cnb` CLI must be installed and authenticated on the
+Hermes host before any `backend(action="create")` call can succeed.
 
 ## Architecture
 
@@ -45,7 +70,9 @@ local Hermes process
     └── CNB lifecycle adapter -> cnb CLI -> no-sync SSH environment
 ```
 
-The router changes only the execution key passed to environment-sensitive tool handlers. Hooks, observability, approvals, and conversation history continue to use the original task/session identifiers.
+The router changes only the execution key passed to environment-sensitive tool
+handlers. Hooks, observability, approvals, and conversation history continue to
+use the original task/session identifiers.
 
 ## Backend resource and CRUD surface
 
@@ -55,14 +82,58 @@ Hermes exposes one service-gated model tool:
 backend(action="create|get|update|delete", ...)
 ```
 
-- `create`: create and register a CNB workspace for an exact repository and branch.
-- `get`: return the current backend and either one backend or all registered backends.
-- `update`: select a backend for the current session. Mutable display metadata may be added later, but lifecycle extension is not promised.
-- `delete`: stop a CNB workspace and remove its local registry record. `local` cannot be deleted.
+- `create`: create and register a CNB workspace for an exact repository slug and
+  git ref.
+- `get`: return the current backend and either one backend or all registered
+  backends.
+- `update`: select a backend for the current session (`current=true` is
+  required). Does not kill old background processes — only switches subsequent
+  tool routing.
+- `delete`: stop a CNB workspace and remove its local registry record. `local`
+  cannot be deleted.
 
-Separate `list`, `current`, `status`, `switch`, `extend`, `stop`, or `acknowledge` tools are deliberately not added.
+Separate `list`, `current`, `status`, `switch`, `extend`, `stop`, or
+`acknowledge` tools are deliberately not added.
 
-The tool is available only when multi-backend execution is enabled in `config.yaml`, preserving Hermes's core-tool footprint for users who do not configure the feature.
+The tool is available only when `execution_backends.enabled` is `true`,
+preserving Hermes's core-tool footprint for users who do not configure the
+feature.
+
+### CRUD detailed contract
+
+**create** — inputs are validated:
+- `backend_id`: 1–64 chars, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
+- `repo`: must be a valid CNB slug (group/subgroup/repo, no leading hyphen).
+- `branch`: must pass `git-check-ref-format` rules (no `..`, `@{`, `~`, `^`,
+  `:`, `?`, `*`, `[`, `\`, whitespace, leading `.`, trailing `.`, trailing `/`,
+  `.lock`, `//`).
+- The CNB CLI `start-workspace` command is invoked; the returned workspace SN
+  is validated before persisting.
+
+**get** — without `id` returns all registered backends plus `local`. With `id`
+returns the specific backend. The current selection (if any) is included in
+every response.
+
+**update** — switches the session's binding. The old backend's background
+processes are **not** killed; subsequent tool calls use the new backend. The
+target backend must be `status == "running"`.
+
+**delete** — safe-dismantle sequence (per-backend lifecycle lock held):
+1. Set status to `deleting` — concurrent routing attempts fail closed.
+2. Stop the remote CNB workspace via `cnb workspace workspace-stop`.
+   - On stop failure: restore original status, preserve
+     DB/bindings/env/overrides/processes, re-raise.
+3. `process_registry.retire_backend(backend_id)` — mark matching running
+   sessions as exited/`backend_lost`. Does **not** send SSH kill signals.
+4. `clear_backend_execution_env(backend_id)` — clean in-memory env keys
+   (old format `execution-backend:<id>`, new format
+   `execution-backend:<id>:session:<hash>`), overrides, cwd, activity, and
+   creation locks.
+5. Delete from DB (bindings, events, record).
+6. Return dumped record with status=`deleted`.
+
+If step 3 or 4 raises (programming error), the DB stays in `deleting` state —
+fail-closed, record not removed. No force-delete path.
 
 ## Local state
 
@@ -72,18 +143,29 @@ Backend state is profile-local and must resolve through `get_hermes_home()`:
 $HERMES_HOME/execution_backends.db
 ```
 
-The database contains no model/provider credential, CNB bearer token, conversation content, memory, or skill content. A CNB record contains only the coordinates required to reconcile or connect to the workspace: backend id, repository, branch, workspace serial number, status, remote SSH target, cwd, and timestamps.
+The database contains no model/provider credential, CNB bearer token,
+conversation content, memory, or skill content. A CNB record contains only the
+coordinates required to reconcile or connect to the workspace: backend id,
+repository, branch, workspace serial number, status, remote SSH target, cwd,
+and timestamps.
 
-`local` is a built-in immutable backend. A session with no binding resolves to `local`.
+`local` is a built-in immutable backend. A session with no binding resolves to
+`local`.
 
 A stable execution key is derived from the selected backend:
 
 ```text
 local selection: preserve the existing task_id behavior
-CNB selection:   execution-backend:<backend-id>
+CNB selection:   execution-backend:<backend-id>:session:<sha256(session-key)[:16]>
 ```
 
-Using the backend id means multiple conversations selecting the same CNB workspace share the same environment object and working directory. Conversation bindings remain independent.
+The session key uses the first 16 hex digits of SHA-256 of the session ID or
+task ID. This prevents raw session/task IDs from leaking into the environment
+key namespace while providing 64 bits of collision entropy.
+
+Same CNB workspace selected by different sessions → shared remote filesystem
+(the CNB workspace is the same). But each session's local SSH environment
+snapshot, cwd, file cache, and env overrides are independent.
 
 ## Tool routing
 
@@ -97,114 +179,162 @@ Environment-sensitive tools are:
 - `patch`
 - `execute_code`
 
-Before registry dispatch, the router resolves the selected backend and supplies the execution task key to these handlers. The original task/session ids continue to be supplied to middleware and post-tool hooks.
+Before registry dispatch, `maybe_resolve_execution_task_id()`:
+1. Skips non-environment tools → returns original `task_id`.
+2. Skips when `execution_backends.enabled` is `false` → returns original
+   `task_id`.
+3. Calls `resolve_execution_task_id()` which:
+   a. Reads the session's current backend from `BackendStore`.
+   b. For `local`: returns `task_id` unchanged.
+   c. For CNB: validates status == `running`, driver == `cnb`, SSH coordinates
+      present.
+   d. Derives the execution key
+      `execution-backend:<id>:session:<sha256(session)[:16]>`.
+   e. **Inside the per-backend lifecycle lock**: re-reads binding + status +
+      workspace_sn. Rejects if the binding changed, status is no longer
+      `running`, or workspace_sn was recreated (delete+recreate-with-same-id
+      guard). Then registers env overrides (SSH host/user/port/key, cwd,
+      `ssh_sync_hermes_home=False`, `ssh_persistent=True`).
+   f. Returns the execution key.
+
+The original task/session ids continue to be supplied to middleware and
+post-tool hooks.
 
 The backend CRUD tool itself always executes locally.
 
 ## CNB adapter contract
 
-The adapter invokes only the installed official `cnb` CLI. Its command runner is injectable so behavior tests never require CNB credentials or create remote resources.
+The adapter invokes only the installed official `cnb` CLI. Its command runner
+is injectable so behavior tests never require CNB credentials or create remote
+resources.
 
-Expected command paths:
+### Runner behavior
+
+- `stdout` is captured and parsed as JSON.
+- `stderr` is **never echoed** in error messages to prevent credential leakage.
+- Non-zero exit → `BackendError("CNB CLI exited with status N")` — no stderr
+  content exposed.
+- Empty stdout on zero exit → `BackendError("CNB CLI produced no output on
+  stdout")`.
+
+### Expected command paths
 
 ```text
 cnb workspace list-workspaces --slug <repo> --branch <branch> --page-size 20 --verbose
 cnb workspace start-workspace --repo <repo> --branch <branch> --verbose
 cnb workspace get-workspace-detail --repo <repo> --sn <sn> --verbose
+cnb workspace workspace-stop --pipelineId <id> --verbose
+cnb workspace workspace-stop --sn <sn> --verbose
 ```
 
-The adapter must:
+### Parsing contract
 
-1. parse the JSON response envelope;
-2. require a 2xx response `status`, even when the CLI exit code is zero;
-3. match repository, branch, and recorded workspace serial number exactly;
-4. require a running workspace and a `remoteSsh` target before routing tools;
-5. never persist or return bearer tokens, cookies, authorization headers, or model credentials;
-6. use a CNB-specific no-sync SSH environment so local `.hermes` files never cross the boundary.
+1. Parse the JSON response envelope.
+2. Require a 2xx response `status`, even when the CLI exit code is zero.
+3. Match repository, branch, and recorded workspace serial number exactly.
+4. Require a running workspace and a `remoteSsh` target before routing tools.
+5. Metadata sanitization: recursively filter sensitive keys (case-insensitive,
+   underscore/hyphen normalized). Blocked keys include: `authorization`,
+   `cookie`, `password`, `secret`, `token`, `api_key`, `apikey`, `credential`,
+   `credentials`, `private_key`, `passphrase`, `access_key`, `secret_key`.
+6. Use a CNB-specific no-sync SSH environment (`ssh_sync_hermes_home=False`) so
+   local `.hermes` files never cross the boundary.
 
-A live CNB E2E remains opt-in because it creates billable/ephemeral infrastructure. Contract tests use captured, secret-free response shapes.
+A live CNB E2E remains opt-in because it creates billable/ephemeral
+infrastructure. Contract tests use captured, secret-free response shapes.
 
 ## CNB lifecycle
 
 CNB's public workspace-recycling documentation is authoritative:
 
-- a newly created workspace may be reclaimed after ten minutes if VS Code is never entered;
-- after the VS Code page is closed, more than ten minutes without activity may reclaim it;
-- continuous heartbeat keeps a workspace for at most 18 hours by default (cluster configuration may differ);
-- a workspace used for more than eight hours is forcibly reclaimed in the 04:00–06:00 window.
+- a newly created workspace may be reclaimed after ten minutes if VS Code is
+  never entered;
+- after the VS Code page is closed, more than ten minutes without activity may
+  reclaim it;
+- continuous heartbeat keeps a workspace for at most 18 hours by default
+  (cluster configuration may differ);
+- a workspace used for more than eight hours is forcibly reclaimed in the
+  04:00–06:00 window.
 
 Reference: <https://docs.cnb.cool/zh/workspaces/workspace-recycling.md>
 
-Hermes must not claim that SSH `ControlMaster` is the documented heartbeat. The lifecycle adapter reconciles actual CNB status. The local deadline monitor computes the earliest predictable hard-risk time in `Asia/Shanghai`:
+Hermes must not claim that SSH `ControlMaster` is the documented heartbeat. The
+local deadline monitor evaluates the earliest predictable hard-risk time in
+`Asia/Shanghai`:
 
 ```text
 min(created_at + 18 hours,
     first time at/after created_at + 8 hours that falls in the 04:00–06:00 window)
 ```
 
-The ten-minute WebIDE rule is not inferred from SSH activity. An early reclaim is detected by status polling.
+The ten-minute WebIDE rule is not inferred from SSH activity.
 
-Planned warning events are one-shot transitions, not prompt-prefix state:
+One-shot event types (persistent dedup via `BackendStore.mark_event_once`):
 
-- `backend.reclaim_warning`
-- `backend.reclaim_critical`
-- `backend.expired`
+- `backend.reclaim_warning` — 30 minutes before the reclaim deadline.
+- `backend.reclaim_critical` — 10 minutes before the reclaim deadline.
+- `backend.expired` — past the reclaim deadline.
 
-The owner conversation is notified before the predictable deadline so the agent can inspect Git state and decide whether to commit and push. Hermes never runs automatic `git add`, `commit`, or `push`.
+Events carry the backend's `owner_session_id` for downstream notification.
 
 ## Failure semantics
 
-- Unknown, deleted, stopped, or expired backend: fail closed with a structured error.
-- CNB CLI error or non-2xx response: preserve the existing session binding and return the error.
-- Backend deletion while selected: affected bindings return to `local` only as an explicit delete consequence recorded by the CRUD result; command execution is never silently retried.
+- Unknown, deleted, stopped, or expired backend: fail closed with a structured
+  error.
+- Orphaned session binding (DB row points to a non-existent backend):
+  `BackendError("unknown backend")`.
+- CNB CLI error or non-2xx response: preserve the existing session binding and
+  return the error.
+- Backend deletion while selected: the binding entry is removed from DB and the
+  session falls back to `local`. Command execution is never silently retried.
 - Remote command failure: report it from that backend; do not replay locally.
-- Lost workspace: a new workspace may be created, but no remote filesystem recovery is claimed.
-- Background process handles remain tied to the environment object that created them.
+- Lost workspace: a new workspace may be created, but no remote filesystem
+  recovery is claimed.
+- Background process handles remain tied to the environment object that created
+  them. After a backend is deleted, matching processes are marked
+  `backend_lost` but **not** killed via SSH.
+- Same backend ID with a changed `workspace_sn` (delete+recreate): the
+  resolver's lifecycle-lock recheck detects the identity change and raises
+  `BackendError` instead of routing to the recreated workspace.
 
 ## Implementation status
 
-The following describes the actual state of the codebase at commit `23ca94656`.
-Items marked **CRITICAL** are bugs that prevent the feature from working.
+### Implemented (core)
 
-### Implemented (Milestone 1 core)
-
-| Component | Status | File(s) |
+| Component | Status | Notes |
 |---|---|---|
-| BackendRecord dataclass | ✅ Complete | `tools/execution_backends.py:52-80` |
-| BackendStore (SQLite CRUD) | ⚠️ Blocked by bug | `tools/execution_backends.py:107-322` |
-| Session binding (set/get current) | ✅ Implemented | `tools/execution_backends.py:249-281` |
-| Event dedup table | ✅ Implemented | `tools/execution_backends.py:145-151` |
-| Execution key derivation | ✅ Implemented | `tools/execution_backends.py:351-387` |
-| Env override registration | ✅ Implemented | `tools/execution_backends.py:372-386` |
-| Tool dispatch routing (model_tools.py) | ✅ Implemented | `model_tools.py:1264-1268` |
-| is_execution_backends_enabled guard | ✅ Implemented | `tools/execution_backends.py:325-330` |
-| Backend CRUD tool registration | ✅ Implemented | `tools/backend_tool.py` |
-| CNBCLIAdapter (parser + runner) | ✅ Implemented | `tools/execution_backends.py:480-622` |
-| Lease deadline calculation | ✅ Implemented | `tools/execution_backends.py:708-735` |
-| BackendLeaseMonitor (warning/critical/expired) | ✅ Implemented | `tools/execution_backends.py:738-868` |
-| No-sync SSH env override | ✅ Implemented | `tools/execution_backends.py:384` |
-| Metadata sanitization | ✅ Implemented | `tools/execution_backends.py:82-91` |
+| BackendRecord dataclass | ✅ Complete | Includes `public_dict()` with metadata sanitization |
+| BackendStore (SQLite CRUD) | ✅ Implemented | Schema: backends, bindings, events tables; ALTER TABLE migration wrapped in try/except |
+| Session binding (set/get current) | ✅ Implemented | `set_current`/`get_current` with fail-closed semantics |
+| Event dedup table | ✅ Implemented | `mark_event_once` with `INSERT OR IGNORE` |
+| Execution key derivation | ✅ Implemented | Format: `execution-backend:<id>:session:<sha256(session)[:16]>` |
+| Session-scoped key (isolation) | ✅ Implemented | `_session_key_hash` — SHA-256 prefix, no raw session ID in key |
+| Env override registration | ✅ Implemented | `ssh_sync_hermes_home=False`, `ssh_persistent=True` |
+| Per-backend lifecycle lock | ✅ Implemented | `_backend_lifecycle_locks` — RLock per backend ID |
+| workspace_sn identity guard | ✅ Implemented | Resolver re-reads inside lock, rejects changed workspace_sn |
+| Tool dispatch routing | ✅ Implemented | `model_tools.py:maybe_resolve_execution_task_id` before registry dispatch |
+| `is_execution_backends_enabled` guard | ✅ Implemented | Config-based enablement |
+| Backend CRUD tool registration | ✅ Implemented | `tools/backend_tool.py` — `check_fn=is_execution_backends_enabled` |
+| CNBCLIAdapter (parser + runner) | ✅ Implemented | stdout-only, stderr never echoed, metadata recursive sanitize |
+| Input validation (repo/branch/backend_id) | ✅ Implemented | `_validate_repo_slug`, `_validate_git_ref`, `_validate_backend_id` |
+| Fail-closed get_current | ✅ Implemented | Missing/not-running backend → `BackendError`, not local fallback |
+| Lease deadline calculation | ✅ Implemented | `earliest_cnb_reclaim_at` pure function |
+| BackendLeaseMonitor (evaluate) | ✅ Implemented | Pure evaluator — warning/critical/expired events with persistent dedup |
+| No-sync SSH env override | ✅ Implemented | `ssh_sync_hermes_home=False` override |
+| Metadata sanitization | ✅ Implemented | Recursive, case-insensitive, underscore/hyphen normalization |
+| Delete cleanup (env/override/cwd) | ✅ Implemented | `clear_backend_execution_env` — matches old and new key formats |
+| Delete process retirement | ✅ Implemented | `process_registry.retire_backend` — marks backend_lost, no SSH kill |
+| Delete fail-closed (status → deleting) | ✅ Implemented | Stop failure restores status; programming error keeps `deleting` |
+| process list includes backend_id | ✅ Implemented | `ProcessSession.backend_id` populated from `_backend_id_from_task_id` |
 
-### Critical issues
-
-**CRITICAL-1** — `tools/execution_backends.py:118-159` — Python code inside SQL `executescript()` string
-
-The `_init_schema()` method embeds a `try:/except:` block of Python code within the multi-line string passed to `self._conn.executescript()`. SQLite's `executescript()` accepts only SQL text. The word `try:` on line 152 is passed to SQLite as SQL, producing `sqlite3.OperationalError: near "try": syntax error`. This prevents `BackendStore.__init__()` from completing, making the entire multi-execution-backend feature non-functional on first use.
-
-**Fix required**: Move the ALTER TABLE migration (lines 152-157) OUTSIDE the `executescript()` call, placing it as a separate `self._conn.execute()` call after the schema string. Since `owner_session_id` is already in the CREATE TABLE definition (line 149), the ALTER TABLE is only needed for databases created before the column was added — consider removing it entirely if no such databases exist in production.
-
-**CRITICAL-2** — `tools/execution_backends.py:152-157` — Migration is skipped even without the syntax error
-
-The CREATE TABLE for `execution_backend_events` (line 145-151) already includes `owner_session_id TEXT NOT NULL DEFAULT ''`. The ALTER TABLE on lines 153-154 attempts to add the same column that already exists. On a fresh database, this would fail with `duplicate column name` (an sqlite3.OperationalError) and would have been caught by the intended `except sqlite3.OperationalError` block — if the try/except weren't inside the SQL string. This is harmless in intended use (migration for pre-existing databases), but the code path is unreachable due to CRITICAL-1.
-
-### Gaps and observations
+### Not implemented (gaps)
 
 | Gap | Severity | Details |
 |---|---|---|
-| Wire routing to `terminal_tool` create path | 🟡 Medium | `resolve_execution_task_id()` registers overrides and returns `"execution-backend:<id>"` as the dispatch key. The terminal tool correctly picks up overrides via `resolve_task_overrides()`. However, `_resolve_container_task_id()` in terminal_tool.py collapses CWD-only overrides back to `"default"` — this could interfere if a CNB routing key is processed before `register_task_env_overrides` has been called. The current execution order in `model_tools.py` (call `maybe_resolve_execution_task_id` before `dispatch`) is correct, but the dependency on ordering is not documented. |
-| No explicit test for no-sync behavior | 🟡 Medium | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` checks that `ssh_sync_hermes_home=False` is passed in the overrides dict, but does NOT verify that the `SSHEnvironment` actually skips file sync when this flag is false. Add a test that inspects whether `_sync_manager` is None when `sync_hermes_home=False`. |
-| No explicit test for original IDs in middleware | 🟡 Medium | The document specifies that "model/tool hooks retain original session/task ids after routing." The code in `model_tools.py` passes the original `session_id` and `task_id` to middleware while routing only `dispatch_task_id` to the handler. This is correct by inspection but has no dedicated test. |
-| `_validate_backend_id` uppercase letters allowed | 🟢 Low | The regex `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` allows uppercase letters, though the document doesn't specify otherwise. Consider whether SQLite's case-insensitive PRIMARY KEY could cause confusion between `cnb-a` and `CNB-A`. |
+| Background lifecycle polling/wakeup | 🟡 Medium | `BackendLeaseMonitor.evaluate()` is a pure function; no background loop or cron job drives it automatically. Event emission and session notification must be triggered externally. |
+| Lifecycle notification delivery | 🟡 Medium | One-shot events are stored in DB but no delivery mechanism (session wake-up, Git-save guidance) is wired. |
+| Opt-in live CNB E2E test | 🟢 Low | All tests use `tmp_path` + mock `CNBCLIAdapter` runners. No test creates a real CNB workspace. User must run E2E manually with real credentials. |
+| CNB create timeout / retry | 🟢 Low | `create_backend` calls `cnb start-workspace` once; no retry on transient failure. |
 
 ## Isolation and verification
 
@@ -217,74 +347,70 @@ Development and tests must not touch the installed Hermes instance:
 - do not restart or replace the running gateway;
 - do not start a real CNB workspace in the default test suite.
 
-### Behavior test coverage (test_execution_backends.py)
-
-| # | Required behavior | Test | Status |
-|---|---|---|---|
-| 1 | Default selection is `local` | `test_store_defaults_every_session_to_local` (line 48) | ✅ |
-| 2 | Two sessions can select different backends | `test_two_sessions_can_select_different_backends` (line 54) | ✅ |
-| 3 | Switching changes only the environment execution key | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` (line 100) | ✅ |
-| 4 | CRUD state survives a new store instance | `test_store_persists_registry_and_binding` (line 65) | ✅ |
-| 5 | Unknown/unready backends fail closed | `test_router_fails_closed_for_unready_backend` (line 132) | ✅ |
-| 6a | CNB parsing rejects non-2xx envelopes | `test_parse_cnb_response_requires_http_success_even_when_cli_succeeded` (line 185) | ✅ |
-| 6b | CNB parsing rejects ambiguous matches | `test_cnb_adapter_requires_exact_unambiguous_workspace_match` (line 197) | ✅ |
-| 6c | CNB detail parses into secret-free record | `test_cnb_adapter_parses_detail_into_secret_free_record` (line 232) | ✅ |
-| 7 | No-sync remote execution never syncs local Hermes files | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` checks override dict (line 128); does NOT verify SSHEnvironment skips FileSyncManager creation | 🟡 Partial |
-| 8a | 18-hour deadline boundaries | `test_earliest_cnb_reclaim_at` parametrized (line 259) | ✅ |
-| 8b | Deadline requires timezone-aware input | `test_earliest_cnb_reclaim_requires_timezone_aware_input` (line 285) | ✅ |
-| 9 | Model/tool hooks retain original session/task ids | No dedicated test; verified by inspection in `model_tools.py:1260-1295` | 🟡 Missing |
-
-### Running the test suite
+### Core test files
 
 ```bash
-# All execution backend tests (no CNB credentials needed)
 cd <hermes-agent-clone>
+
+# BackendStore + CRUD + monitor + adapter
 python -m pytest tests/tools/test_execution_backends.py -v --tb=short
 
-# With coverage
-python -m pytest tests/tools/test_execution_backends.py \
-  --cov=tools.execution_backends --cov=tools.backend_tool \
-  --cov-report=term-missing
+# Routing, disable-by-default, process ownership
+python -m pytest tests/tools/test_backend_routing.py -v --tb=short
 
-# Test without the critical bug (after fix)
-# See CRITICAL-1 above
+# Session-scoped execution keys, RLock concurrency
+python -m pytest tests/tools/test_backend_session_isolation.py -v --tb=short
+
+# Input validation, metadata sanitization, fail-closed, CNB runner security
+python -m pytest tests/tools/test_execution_backend_security.py -v --tb=short
+
+# Delete cleanup: status→deleting, stop failure recovery,
+# env/override/cwd retirement, lifecycle-lock serialization
+python -m pytest tests/tools/test_backend_delete_cleanup.py -v --tb=short
 ```
 
-**Note**: Due to **CRITICAL-1** (`tools/execution_backends.py:118-159`), `BackendStore.__init__()` raises `sqlite3.OperationalError`. Run the isolated test above to reproduce the failure. The fix must be applied before any test can pass.
+All tests use `tmp_path` for `BackendStore`, injectable `CNBCLIAdapter` runners
+(no real CLI, no network), and deterministic time for `BackendLeaseMonitor`.
+No test suite touches the network or requires CNB credentials.
 
-## Isolation test procedure
+### Test characteristics
 
-To add a new behavior test:
-
-1. **Fixture**: use `tests/tools/test_execution_backends.py`'s `store` fixture (line 27), which creates a `BackendStore` at `tmp_path / "execution_backends.db"`. This guarantees zero interaction with the real Hermes home.
-2. **No CNB credentials**: use the injectable `CNBCLIAdapter(runner=lambda argv: ...)` pattern for all CLI interaction tests.
-3. **No real SSH**: the routing test (`test_router_uses_stable_backend_key_and_no_sync_ssh_override`) monkeypatches `register_task_env_overrides` to capture overrides without creating a live SSH connection.
-4. **Deterministic time**: `BackendLeaseMonitor.evaluate()` accepts a `now` parameter; use it with known `datetime` values.
-5. **Runtime dependencies**: tests must not import or run any live `cnb` CLI commands, establish SSH connections, or access files outside `tmp_path`.
+| Property | Value |
+|---|---|
+| Hermes home isolation | `tmp_path` via `store(tmp_path)` fixture |
+| CNB CLI dependency | None — `CNBCLIAdapter(runner=...)` injectable |
+| Network calls | None |
+| SSH connections | None — routing tests monkeypatch `register_task_env_overrides` |
+| Real clocks | Deterministic — `BackendLeaseMonitor.evaluate()` accepts `now=` |
 
 ## Delivery phases
 
-### Milestone 1: control-plane MVP
+### Milestone 1: control-plane MVP ✅ Completed
 
-- ✅ local SQLite store and session bindings (blocked by CRITICAL-1)
-- ✅ one CRUD tool
-- ✅ deterministic environment-tool routing
+- ✅ local SQLite store and session bindings
+- ✅ one CRUD tool (create/get/update/delete)
+- ✅ deterministic environment-tool routing with lifecycle-lock serialization
+- ✅ session-scoped execution keys (`sha256` prefix, no raw ID)
+- ✅ workspace_sn identity guard against delete+recreate
 - ✅ per-task environment type/SSH overrides
 - ✅ no-sync SSH mode for CNB
 - ✅ CNB CLI parsing contract and lifecycle pure functions
-- ✅ isolated behavior tests (blocked by CRITICAL-1)
+- ✅ input validation (repo slug, git ref, backend id)
+- ✅ fail-closed semantics (missing/stopped backend, orphaned binding)
+- ✅ delete safe-dismantle (status → deleting, stop, retire, clear env, DB prune)
+- ✅ metadata sanitization (recursive, case-insensitive)
+- ✅ isolated behavior tests (all tmp_path, no network)
+- ✅ BackendLeaseMonitor pure evaluator
 
-### Milestone 2: live lifecycle integration
+### Milestone 2: live lifecycle integration ☐
 
-- ☐ CNB create/detail/stop reconciliation against a dedicated test repository
-- ☐ WebIDE heartbeat integration using a documented supported mechanism
-- ☐ background polling and one-shot session events
-- ☐ owner-session wake-up and Git-save guidance
-- ☐ opt-in real CNB E2E evidence
+- ☐ Background polling loop or cron-driven `BackendLeaseMonitor.evaluate()`
+- ☐ Session wake-up and Git-save guidance on reclaim events
+- ☐ Opt-in real CNB E2E evidence
 
-### Milestone 3: operator UX
+### Milestone 3: operator UX ☐
 
 - ☐ `hermes tools` configuration UX
 - ☐ TUI/Desktop backend indicator and picker
-- ☐ lifecycle notifications across messaging platforms
-- ☐ migration and recovery diagnostics
+- ☐ Lifecycle notifications across messaging platforms
+- ☐ Migration and recovery diagnostics
