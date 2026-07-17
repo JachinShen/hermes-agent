@@ -28,8 +28,30 @@ CNB_OVERNIGHT_MIN_AGE = timedelta(hours=8)
 CNB_OVERNIGHT_START = time(4, 0)
 CNB_OVERNIGHT_END = time(6, 0)
 _BACKEND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_SENSITIVE_METADATA_KEYS = frozenset(
-    {"authorization", "cookie", "password", "secret", "token"}
+# CNB repo slug: group[/subgroup]/repo.  Each segment starts with
+# alphanumeric, underscore, or dot; continues with those plus hyphen.
+_REPO_SLUG_RE = re.compile(
+    r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*(/[a-zA-Z0-9_.][a-zA-Z0-9_.-]*)*$"
+)
+# Git ref forbidden patterns (git-check-ref-format rules).
+_GIT_REF_FORBIDDEN = re.compile(r"(\.\.|@\{|[~^:?*\[\\])|[\x00-\x20\x7f]")
+_SENSITIVE_METADATA_KEYS = frozenset({
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "credential",
+    "credentials",
+    "private_key",
+    "passphrase",
+    "access_key",
+    "secret_key",
+})
+_SENSITIVE_KEYS_NORMALIZED = frozenset(
+    k.replace("_", "-").replace(" ", "") for k in _SENSITIVE_METADATA_KEYS
 )
 
 ENVIRONMENT_TOOL_NAMES = frozenset(
@@ -84,11 +106,22 @@ def _sanitize_metadata(value: Any) -> Any:
         return {
             str(key): _sanitize_metadata(item)
             for key, item in value.items()
-            if str(key).lower() not in _SENSITIVE_METADATA_KEYS
+            if not _is_sensitive_key(str(key))
         }
     if isinstance(value, list):
         return [_sanitize_metadata(item) for item in value]
     return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """Check if a metadata key matches any sensitive pattern, case-insensitively
+    with underscore/hyphen normalization."""
+    lowered = key.lower()
+    return (
+        lowered in _SENSITIVE_METADATA_KEYS
+        or lowered.replace("_", "-") in _SENSITIVE_KEYS_NORMALIZED
+        or lowered.replace("-", "_") in _SENSITIVE_METADATA_KEYS
+    )
 
 
 def _utc_now_iso() -> str:
@@ -102,6 +135,47 @@ def _validate_backend_id(backend_id: str) -> str:
             "backend id must be 1-64 characters using letters, numbers, '.', '_' or '-'"
         )
     return backend_id
+
+
+def _validate_repo_slug(repo: str) -> str:
+    repo = str(repo or "").strip()
+    if not repo:
+        raise BackendError("repo must not be empty")
+    if repo.startswith("-"):
+        raise BackendError("repo must not start with a hyphen (option-like value)")
+    if not _REPO_SLUG_RE.fullmatch(repo):
+        raise BackendError(
+            "repo must be a valid CNB slug: group[/subgroup]/repo "
+            "using letters, digits, '.', '_', '-'"
+        )
+    return repo
+
+
+def _validate_git_ref(branch: str) -> str:
+    branch = str(branch or "").strip()
+    if not branch:
+        raise BackendError("branch must not be empty")
+    if branch.startswith("-"):
+        raise BackendError("branch must not start with a hyphen (option-like value)")
+    if branch.startswith(".") or branch.endswith("."):
+        raise BackendError("branch must not start or end with a dot")
+    if branch.endswith("/"):
+        raise BackendError("branch must not end with a slash")
+    if branch.endswith(".lock"):
+        raise BackendError("branch must not end with .lock")
+    if "//" in branch:
+        raise BackendError("branch must not contain consecutive slashes")
+    if _GIT_REF_FORBIDDEN.search(branch):
+        raise BackendError(
+            "branch contains forbidden characters (.., @{, ~^:?*[\\, "
+            "whitespace, or control characters)"
+        )
+    return branch
+
+
+def _validate_create_inputs(repo: str, branch: str) -> tuple[str, str]:
+    """Validate repo slug and git ref for CNB create operations."""
+    return _validate_repo_slug(repo), _validate_git_ref(branch)
 
 
 class BackendStore:
@@ -276,10 +350,15 @@ class BackendStore:
             ).fetchone()
         if row is None:
             return BackendRecord.local()
-        try:
-            return self.get_backend(str(row["backend_id"]))
-        except BackendError:
-            return BackendRecord.local()
+        backend_id = str(row["backend_id"])
+        # Fail-closed: if the session has a binding, the backend MUST exist
+        # and be running — no silent fallback to local.
+        record = self.get_backend(backend_id)
+        if record.status != "running":
+            raise BackendError(
+                f"backend {backend_id} is not ready (status={record.status})"
+            )
+        return record
 
     def delete_backend(self, backend_id: str) -> BackendRecord:
         backend_id = _validate_backend_id(backend_id)
@@ -434,10 +513,14 @@ def _default_cnb_runner(argv: list[str]) -> str:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise BackendError(f"CNB CLI execution failed: {type(exc).__name__}") from exc
-    raw = result.stdout.strip() or result.stderr.strip()
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
     if result.returncode != 0:
+        # Do NOT echo raw stderr which may contain tokens/credentials.
         raise BackendError(f"CNB CLI exited with status {result.returncode}")
-    return raw
+    if not stdout:
+        raise BackendError("CNB CLI produced no output on stdout")
+    return stdout
 
 
 def _first_value(mapping: dict[str, Any], *names: str) -> Any:
@@ -664,11 +747,8 @@ def backend_tool(
         backend_id = _validate_backend_id(backend_id)
         repo = str(args.get("repo") or "").strip()
         branch = str(args.get("branch") or "").strip()
-        if not repo or not branch:
-            raise BackendError("create requires repo and branch")
-        record = cnb.create_backend(
-            backend_id=backend_id, repo=repo, branch=branch
-        )
+        repo, branch = _validate_create_inputs(repo, branch)
+        record = cnb.create_backend(backend_id=backend_id, repo=repo, branch=branch)
         record.owner_session_id = session_key
         backend_store.create_backend(record)
         return _backend_result(
