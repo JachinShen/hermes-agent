@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -41,7 +41,7 @@ def running_cnb(backend_id: str, *, host: str) -> BackendRecord:
         ssh_user="dev",
         ssh_port=22,
         cwd="/workspace",
-        created_at="2026-07-17T01:00:00+08:00",
+        created_at="2026-07-17T19:00:00+08:00",
     )
 
 
@@ -248,7 +248,7 @@ def test_cnb_adapter_parses_detail_into_secret_free_record() -> None:
         repo="example/repo",
         branch="main",
         workspace_sn="sn-1",
-        created_at="2026-07-17T01:00:00+08:00",
+        created_at="2026-07-17T19:00:00+08:00",
     )
 
     assert record.ssh_user == "dev"
@@ -331,7 +331,12 @@ def test_monitor_unknown_backend_returns_unknown(store: BackendStore) -> None:
 
 def test_monitor_non_cnb_backend_skips_lease(store: BackendStore) -> None:
     record = BackendRecord(id="custom", driver="custom", status="running")
-    store.create_backend(record)
+    store._conn.execute(
+        "INSERT INTO execution_backends "
+        "(id, driver, status, created_at, updated_at, metadata_json) "
+        "VALUES (?, ?, ?, '2026-07-17T10:00:00+00:00', '2026-07-17T10:00:00+00:00', '{}')",
+        (record.id, record.driver, record.status),
+    )
     monitor = BackendLeaseMonitor(store)
     result = monitor.evaluate("custom")
     assert result["status"] == "ok"
@@ -342,13 +347,15 @@ def test_monitor_non_cnb_backend_skips_lease(store: BackendStore) -> None:
 def test_monitor_cnb_far_from_deadline_returns_ok(store: BackendStore) -> None:
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
-    # Created at 01:00, deadline = min(01:00+18h=19:00, overnight at 04:00 next day)
-    # = 04:00 on July 18.  "now" at 03:00 on July 17 → 25 hours from deadline.
-    now = datetime(2026, 7, 17, 3, 0, tzinfo=SHANGHAI)
+    # Created at 19:00, deadline = min(
+    #   19:00+18h=13:00 next day, 04:00 next day (overnight)
+    # ) = 04:00 on July 18.
+    # "now" at 21:00 on July 17 → 7 hours before deadline → "ok".
+    now = datetime(2026, 7, 17, 21, 0, tzinfo=SHANGHAI)
     result = monitor.evaluate("cnb-test", now=now)
     assert result["status"] == "ok"
     assert result["events_fired"] == []
@@ -358,7 +365,7 @@ def test_monitor_cnb_far_from_deadline_returns_ok(store: BackendStore) -> None:
 def test_monitor_warning_zone_fires_reclaim_warning(store: BackendStore) -> None:
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
@@ -369,11 +376,10 @@ def test_monitor_warning_zone_fires_reclaim_warning(store: BackendStore) -> None
     assert result["status"] == "warning"
     assert result["events_fired"] == ["backend.reclaim_warning"]
 
-
 def test_monitor_critical_zone_fires_critical(store: BackendStore) -> None:
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
@@ -383,11 +389,10 @@ def test_monitor_critical_zone_fires_critical(store: BackendStore) -> None:
     assert result["status"] == "critical"
     assert result["events_fired"] == ["backend.reclaim_critical"]
 
-
 def test_monitor_expired_fires_expired(store: BackendStore) -> None:
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
@@ -402,7 +407,7 @@ def test_monitor_fires_only_one_event_type_per_evaluation(store: BackendStore) -
     """When multiple thresholds are crossed, the highest-severity fires."""
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
@@ -417,7 +422,7 @@ def test_monitor_dedup_returns_empty_events_fired_on_second_call(store: BackendS
     """Persistent dedup: second evaluate with same clock should fire nothing."""
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     monitor = BackendLeaseMonitor(store)
@@ -437,7 +442,7 @@ def test_monitor_dedup_survives_store_reopen(tmp_path: Path) -> None:
     first_store = BackendStore(path)
     first_store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
         )
     )
     first = BackendLeaseMonitor(first_store)
@@ -457,7 +462,7 @@ def test_monitor_dedup_survives_store_reopen(tmp_path: Path) -> None:
 def test_monitor_carries_owner_session_id(store: BackendStore) -> None:
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
             owner_session_id="session-abc",
         )
     )
@@ -472,7 +477,7 @@ def test_monitor_owner_session_stored_in_event_table(store: BackendStore) -> Non
     """Verify the owner_session_id is persisted alongside the event."""
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
             owner_session_id="session-xyz",
         )
     )
@@ -493,15 +498,15 @@ def test_monitor_expired_transitions_from_warning_via_critical(store: BackendSto
     """Simulate clock progression through all three phases."""
     store.create_backend(
         _cnb_backend(
-            created_at="2026-07-17T01:00:00+08:00",
+            created_at="2026-07-17T19:00:00+08:00",
             owner_session_id="session-progress",
         )
     )
     monitor = BackendLeaseMonitor(store)
     deadline = datetime(2026, 7, 18, 4, 0, tzinfo=SHANGHAI)
 
-    # Phase 1: ok (25 hours before deadline)
-    r1 = monitor.evaluate("cnb-test", now=datetime(2026, 7, 17, 3, 0, tzinfo=SHANGHAI))
+    # Phase 1: ok (7 hours before deadline)
+    r1 = monitor.evaluate("cnb-test", now=datetime(2026, 7, 17, 21, 0, tzinfo=SHANGHAI))
     assert r1["status"] == "ok"
     assert r1["events_fired"] == []
 

@@ -149,14 +149,15 @@ class BackendStore:
                     owner_session_id TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (backend_id, event_type)
                 );
-                try:
-                    self._conn.execute(
-                        "ALTER TABLE execution_backend_events ADD COLUMN owner_session_id TEXT NOT NULL DEFAULT ''"
-                    )
-                except sqlite3.OperationalError:
-                    pass  # column already exists
                 """
             )
+            # Migrate existing databases that lack the owner_session_id column.
+            try:
+                self._conn.execute(
+                    "ALTER TABLE execution_backend_events ADD COLUMN owner_session_id TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def close(self) -> None:
         with self._lock:
