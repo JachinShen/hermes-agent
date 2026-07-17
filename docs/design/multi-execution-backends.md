@@ -161,6 +161,51 @@ The owner conversation is notified before the predictable deadline so the agent 
 - Lost workspace: a new workspace may be created, but no remote filesystem recovery is claimed.
 - Background process handles remain tied to the environment object that created them.
 
+## Implementation status
+
+The following describes the actual state of the codebase at commit `23ca94656`.
+Items marked **CRITICAL** are bugs that prevent the feature from working.
+
+### Implemented (Milestone 1 core)
+
+| Component | Status | File(s) |
+|---|---|---|
+| BackendRecord dataclass | ✅ Complete | `tools/execution_backends.py:52-80` |
+| BackendStore (SQLite CRUD) | ⚠️ Blocked by bug | `tools/execution_backends.py:107-322` |
+| Session binding (set/get current) | ✅ Implemented | `tools/execution_backends.py:249-281` |
+| Event dedup table | ✅ Implemented | `tools/execution_backends.py:145-151` |
+| Execution key derivation | ✅ Implemented | `tools/execution_backends.py:351-387` |
+| Env override registration | ✅ Implemented | `tools/execution_backends.py:372-386` |
+| Tool dispatch routing (model_tools.py) | ✅ Implemented | `model_tools.py:1264-1268` |
+| is_execution_backends_enabled guard | ✅ Implemented | `tools/execution_backends.py:325-330` |
+| Backend CRUD tool registration | ✅ Implemented | `tools/backend_tool.py` |
+| CNBCLIAdapter (parser + runner) | ✅ Implemented | `tools/execution_backends.py:480-622` |
+| Lease deadline calculation | ✅ Implemented | `tools/execution_backends.py:708-735` |
+| BackendLeaseMonitor (warning/critical/expired) | ✅ Implemented | `tools/execution_backends.py:738-868` |
+| No-sync SSH env override | ✅ Implemented | `tools/execution_backends.py:384` |
+| Metadata sanitization | ✅ Implemented | `tools/execution_backends.py:82-91` |
+
+### Critical issues
+
+**CRITICAL-1** — `tools/execution_backends.py:118-159` — Python code inside SQL `executescript()` string
+
+The `_init_schema()` method embeds a `try:/except:` block of Python code within the multi-line string passed to `self._conn.executescript()`. SQLite's `executescript()` accepts only SQL text. The word `try:` on line 152 is passed to SQLite as SQL, producing `sqlite3.OperationalError: near "try": syntax error`. This prevents `BackendStore.__init__()` from completing, making the entire multi-execution-backend feature non-functional on first use.
+
+**Fix required**: Move the ALTER TABLE migration (lines 152-157) OUTSIDE the `executescript()` call, placing it as a separate `self._conn.execute()` call after the schema string. Since `owner_session_id` is already in the CREATE TABLE definition (line 149), the ALTER TABLE is only needed for databases created before the column was added — consider removing it entirely if no such databases exist in production.
+
+**CRITICAL-2** — `tools/execution_backends.py:152-157` — Migration is skipped even without the syntax error
+
+The CREATE TABLE for `execution_backend_events` (line 145-151) already includes `owner_session_id TEXT NOT NULL DEFAULT ''`. The ALTER TABLE on lines 153-154 attempts to add the same column that already exists. On a fresh database, this would fail with `duplicate column name` (an sqlite3.OperationalError) and would have been caught by the intended `except sqlite3.OperationalError` block — if the try/except weren't inside the SQL string. This is harmless in intended use (migration for pre-existing databases), but the code path is unreachable due to CRITICAL-1.
+
+### Gaps and observations
+
+| Gap | Severity | Details |
+|---|---|---|
+| Wire routing to `terminal_tool` create path | 🟡 Medium | `resolve_execution_task_id()` registers overrides and returns `"execution-backend:<id>"` as the dispatch key. The terminal tool correctly picks up overrides via `resolve_task_overrides()`. However, `_resolve_container_task_id()` in terminal_tool.py collapses CWD-only overrides back to `"default"` — this could interfere if a CNB routing key is processed before `register_task_env_overrides` has been called. The current execution order in `model_tools.py` (call `maybe_resolve_execution_task_id` before `dispatch`) is correct, but the dependency on ordering is not documented. |
+| No explicit test for no-sync behavior | 🟡 Medium | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` checks that `ssh_sync_hermes_home=False` is passed in the overrides dict, but does NOT verify that the `SSHEnvironment` actually skips file sync when this flag is false. Add a test that inspects whether `_sync_manager` is None when `sync_hermes_home=False`. |
+| No explicit test for original IDs in middleware | 🟡 Medium | The document specifies that "model/tool hooks retain original session/task ids after routing." The code in `model_tools.py` passes the original `session_id` and `task_id` to middleware while routing only `dispatch_task_id` to the handler. This is correct by inspection but has no dedicated test. |
+| `_validate_backend_id` uppercase letters allowed | 🟢 Low | The regex `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` allows uppercase letters, though the document doesn't specify otherwise. Consider whether SQLite's case-insensitive PRIMARY KEY could cause confusion between `cnb-a` and `CNB-A`. |
+
 ## Isolation and verification
 
 Development and tests must not touch the installed Hermes instance:
@@ -172,41 +217,74 @@ Development and tests must not touch the installed Hermes instance:
 - do not restart or replace the running gateway;
 - do not start a real CNB workspace in the default test suite.
 
-Required behavior tests:
+### Behavior test coverage (test_execution_backends.py)
 
-1. default selection is `local`;
-2. two sessions can select different backends;
-3. switching changes only the environment execution key;
-4. CRUD state survives a new store instance under the same temporary home;
-5. unknown/unready backends fail closed;
-6. CNB response parsing rejects non-2xx envelopes and ambiguous workspace matches;
-7. no-sync remote execution never enumerates or transfers local Hermes files;
-8. the 18-hour and overnight deadline calculations cover boundary times;
-9. model/tool hooks retain original session/task ids after routing.
+| # | Required behavior | Test | Status |
+|---|---|---|---|
+| 1 | Default selection is `local` | `test_store_defaults_every_session_to_local` (line 48) | ✅ |
+| 2 | Two sessions can select different backends | `test_two_sessions_can_select_different_backends` (line 54) | ✅ |
+| 3 | Switching changes only the environment execution key | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` (line 100) | ✅ |
+| 4 | CRUD state survives a new store instance | `test_store_persists_registry_and_binding` (line 65) | ✅ |
+| 5 | Unknown/unready backends fail closed | `test_router_fails_closed_for_unready_backend` (line 132) | ✅ |
+| 6a | CNB parsing rejects non-2xx envelopes | `test_parse_cnb_response_requires_http_success_even_when_cli_succeeded` (line 185) | ✅ |
+| 6b | CNB parsing rejects ambiguous matches | `test_cnb_adapter_requires_exact_unambiguous_workspace_match` (line 197) | ✅ |
+| 6c | CNB detail parses into secret-free record | `test_cnb_adapter_parses_detail_into_secret_free_record` (line 232) | ✅ |
+| 7 | No-sync remote execution never syncs local Hermes files | `test_router_uses_stable_backend_key_and_no_sync_ssh_override` checks override dict (line 128); does NOT verify SSHEnvironment skips FileSyncManager creation | 🟡 Partial |
+| 8a | 18-hour deadline boundaries | `test_earliest_cnb_reclaim_at` parametrized (line 259) | ✅ |
+| 8b | Deadline requires timezone-aware input | `test_earliest_cnb_reclaim_requires_timezone_aware_input` (line 285) | ✅ |
+| 9 | Model/tool hooks retain original session/task ids | No dedicated test; verified by inspection in `model_tools.py:1260-1295` | 🟡 Missing |
+
+### Running the test suite
+
+```bash
+# All execution backend tests (no CNB credentials needed)
+cd <hermes-agent-clone>
+python -m pytest tests/tools/test_execution_backends.py -v --tb=short
+
+# With coverage
+python -m pytest tests/tools/test_execution_backends.py \
+  --cov=tools.execution_backends --cov=tools.backend_tool \
+  --cov-report=term-missing
+
+# Test without the critical bug (after fix)
+# See CRITICAL-1 above
+```
+
+**Note**: Due to **CRITICAL-1** (`tools/execution_backends.py:118-159`), `BackendStore.__init__()` raises `sqlite3.OperationalError`. Run the isolated test above to reproduce the failure. The fix must be applied before any test can pass.
+
+## Isolation test procedure
+
+To add a new behavior test:
+
+1. **Fixture**: use `tests/tools/test_execution_backends.py`'s `store` fixture (line 27), which creates a `BackendStore` at `tmp_path / "execution_backends.db"`. This guarantees zero interaction with the real Hermes home.
+2. **No CNB credentials**: use the injectable `CNBCLIAdapter(runner=lambda argv: ...)` pattern for all CLI interaction tests.
+3. **No real SSH**: the routing test (`test_router_uses_stable_backend_key_and_no_sync_ssh_override`) monkeypatches `register_task_env_overrides` to capture overrides without creating a live SSH connection.
+4. **Deterministic time**: `BackendLeaseMonitor.evaluate()` accepts a `now` parameter; use it with known `datetime` values.
+5. **Runtime dependencies**: tests must not import or run any live `cnb` CLI commands, establish SSH connections, or access files outside `tmp_path`.
 
 ## Delivery phases
 
 ### Milestone 1: control-plane MVP
 
-- local SQLite store and session bindings;
-- one CRUD tool;
-- deterministic environment-tool routing;
-- per-task environment type/SSH overrides;
-- no-sync SSH mode for CNB;
-- CNB CLI parsing contract and lifecycle pure functions;
-- isolated behavior tests.
+- ✅ local SQLite store and session bindings (blocked by CRITICAL-1)
+- ✅ one CRUD tool
+- ✅ deterministic environment-tool routing
+- ✅ per-task environment type/SSH overrides
+- ✅ no-sync SSH mode for CNB
+- ✅ CNB CLI parsing contract and lifecycle pure functions
+- ✅ isolated behavior tests (blocked by CRITICAL-1)
 
 ### Milestone 2: live lifecycle integration
 
-- CNB create/detail/stop reconciliation against a dedicated test repository;
-- WebIDE heartbeat integration using a documented supported mechanism;
-- background polling and one-shot session events;
-- owner-session wake-up and Git-save guidance;
-- opt-in real CNB E2E evidence.
+- ☐ CNB create/detail/stop reconciliation against a dedicated test repository
+- ☐ WebIDE heartbeat integration using a documented supported mechanism
+- ☐ background polling and one-shot session events
+- ☐ owner-session wake-up and Git-save guidance
+- ☐ opt-in real CNB E2E evidence
 
 ### Milestone 3: operator UX
 
-- `hermes tools` configuration UX;
-- TUI/Desktop backend indicator and picker;
-- lifecycle notifications across messaging platforms;
-- migration and recovery diagnostics.
+- ☐ `hermes tools` configuration UX
+- ☐ TUI/Desktop backend indicator and picker
+- ☐ lifecycle notifications across messaging platforms
+- ☐ migration and recovery diagnostics
