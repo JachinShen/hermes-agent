@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import shlex
 import sqlite3
@@ -22,8 +21,6 @@ from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from hermes_cli.config import get_hermes_home, load_config
-
-logger = logging.getLogger(__name__)
 
 
 CNB_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -428,10 +425,11 @@ _store_cache_lock = threading.Lock()
 #
 # Lock granularity is per-backend — other backends are never blocked.
 # Locks persist in the registry so that the same backend ID always reuses
-# the same lock object.  This prevents an old thread that already holds the
-# lock from racing with a freshly rebuilt backend (e.g. delete followed by
-# create-with-same-id) — creating a fresh lock per call would not provide
-# this safety.
+# the same lock object.  Inside the lock, the resolver additionally verifies
+# ``workspace_sn`` identity: after a delete+create-with-same-id, the old
+# in-flight resolver detects the changed workspace identity and raises
+# ``BackendError`` rather than registering overrides for the recreated
+# workspace.
 _backend_lifecycle_locks: dict[str, threading.RLock] = {}
 _backend_lifecycle_locks_lock = threading.Lock()
 
@@ -491,6 +489,9 @@ def resolve_execution_task_id(
     * If the backend's status is no longer ``running`` (e.g. ``deleting``) →
       raise ``BackendError`` so the caller does not route to a vanishing
       workspace.
+    * If the backend's ``workspace_sn`` differs from the pre-lock read →
+      raise ``BackendError`` so the caller does not route to a workspace
+      that was recreated with the same backend ID after a delete.
     """
     backend_store = store or get_backend_store()
     sk = _session_key(session_id, task_id)
@@ -512,7 +513,10 @@ def resolve_execution_task_id(
     # ── Late-registration race guard ─────────────────────────────────
     # Acquire the backend's lifecycle lock and re-read the binding + status.
     # If a concurrent delete set status→deleting between get_current and
-    # here, we detect it and refuse to register.
+    # here, we detect it and refuse to register.  The workspace_sn recheck
+    # below also catches delete-then-recreate-with-same-id: an old
+    # in-flight resolver that read a different workspace_sn outside the
+    # lock will be rejected.
     lifecycle_lock = _get_backend_lifecycle_lock(record.id)
     with lifecycle_lock:
         # Re-read the session binding — it may have changed.
@@ -529,6 +533,12 @@ def resolve_execution_task_id(
         if current_record.status != "running":
             raise BackendError(
                 f"backend {record.id} is not ready (status={current_record.status})"
+            )
+        if current_record.workspace_sn != record.workspace_sn:
+            raise BackendError(
+                f"backend {record.id} was recreated or changed "
+                f"(workspace_sn: {record.workspace_sn} → "
+                f"{current_record.workspace_sn}); retry"
             )
         if not current_record.ssh_host or not current_record.ssh_user:
             raise BackendError(

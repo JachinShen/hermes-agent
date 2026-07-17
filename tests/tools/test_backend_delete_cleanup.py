@@ -1048,3 +1048,140 @@ def test_resolve_delete_race_clear_env_error_fail_closed(
         f"expected BackendError, got {type(resolver_errors[0]).__name__}"
     )
     mock_register.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# J) Workspace-sn identity check: delete + recreate-with-same-id
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rejects_same_id_recreated_workspace(
+    tmp_path: Path,
+) -> None:
+    """Resolver detects ``workspace_sn`` change when a backend is deleted and
+    recreated with the same ID but a different CNB workspace.
+
+    Uses ``threading.Event`` handoffs (no ``sleep``) for deterministic
+    ordering:
+
+    1. Resolver reads initial record (``workspace_sn='sn-old'``), signals
+       ``resolver_read_initial``, then blocks.
+    2. Delete thread holds the lifecycle lock, fully removes the DB record
+       (``delete_backend``), creates a **new** backend with the same ID
+       but ``workspace_sn='sn-new'``, and rebinds the session — all while
+       holding the lock.
+    3. Resolver is released; inside the lifecycle lock it re-reads the
+       binding.  ``get_current`` returns the recreated record (different
+       ``workspace_sn``).  The identity check raises ``BackendError``.
+    4. ``register_task_env_overrides`` is **never** called.
+    """
+    backend_id = "cnb-a"
+    store = BackendStore(tmp_path / "recreate_workspace_sn.db")
+
+    store.create_backend(
+        BackendRecord(
+            id=backend_id,
+            driver="cnb",
+            status="running",
+            repo="g/r",
+            branch="main",
+            workspace_sn="sn-old",
+            pipeline_id="p",
+            ssh_host="h",
+            ssh_user="u",
+        )
+    )
+    store.set_current("session-x", backend_id)
+
+    resolver_read_initial = threading.Event()
+    resolver_proceed = threading.Event()
+    resolver_errors: list[Exception] = []
+
+    original_get_current = store.get_current
+
+    def _sync_get_current(sk: str) -> BackendRecord:
+        result = original_get_current(sk)
+        if result.id != "local" and result.status == "running":
+            resolver_read_initial.set()
+            assert resolver_proceed.wait(timeout=10), (
+                "resolver timed out waiting for delete+recreate"
+            )
+        return result
+
+    with (
+        patch.object(store, "get_current", wraps=_sync_get_current),
+        patch(
+            "tools.terminal_tool.register_task_env_overrides"
+        ) as mock_register,
+    ):
+
+        def _delete_and_recreate() -> None:
+            lock = _get_backend_lifecycle_lock(backend_id)
+            with lock:
+                # Fully remove from DB (bindings + record).
+                store.delete_backend(backend_id)
+                # Create a new backend with the same ID but a different
+                # workspace_sn (simulating delete-then-recreate).
+                store.create_backend(
+                    BackendRecord(
+                        id=backend_id,
+                        driver="cnb",
+                        status="running",
+                        repo="g/r",
+                        branch="main",
+                        workspace_sn="sn-new",
+                        pipeline_id="p2",
+                        ssh_host="h",
+                        ssh_user="u",
+                    )
+                )
+                # Rebind the session to the new record.
+                store.set_current("session-x", backend_id)
+
+        def _run_resolver() -> None:
+            try:
+                resolve_execution_task_id(
+                    task_id="task-x",
+                    session_id="session-x",
+                    store=store,
+                )
+            except BackendError as e:
+                resolver_errors.append(e)
+            except Exception as e:
+                resolver_errors.append(e)
+
+        resolver_thread = threading.Thread(
+            target=_run_resolver, daemon=True
+        )
+        delete_thread = threading.Thread(
+            target=_delete_and_recreate, daemon=True
+        )
+
+        # Step 1: Resolver starts, reads running record with sn-old, pauses.
+        resolver_thread.start()
+        resolver_read_initial.wait(timeout=10)
+
+        # Step 2: Delete holds lifecycle lock, removes record, creates
+        # new record with sn-new, rebinds — all before releasing lock.
+        delete_thread.start()
+        delete_thread.join(timeout=10)
+
+        # Step 3: Release resolver — it enters lifecycle lock, re-reads,
+        # detects workspace_sn mismatch → BackendError.
+        resolver_proceed.set()
+        resolver_thread.join(timeout=10)
+
+    # Step 4: Assertions
+    assert len(resolver_errors) == 1, (
+        f"expected exactly one BackendError, got {len(resolver_errors)}"
+    )
+    assert isinstance(resolver_errors[0], BackendError), (
+        f"expected BackendError, got {type(resolver_errors[0]).__name__}"
+    )
+    error_msg = str(resolver_errors[0]).lower()
+    assert "recreated" in error_msg or "changed" in error_msg, (
+        f"error message should mention recreated or changed: {error_msg}"
+    )
+    assert "sn-old" in str(resolver_errors[0])
+    assert "sn-new" in str(resolver_errors[0])
+    mock_register.assert_not_called()
