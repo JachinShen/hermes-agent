@@ -13,6 +13,7 @@ from tools.execution_backends import (
     BackendLeaseMonitor,
     CNBCLIAdapter,
     BackendError,
+    _session_key_hash,  # noqa: PLC2701
     backend_tool,
     earliest_cnb_reclaim_at,
     parse_cnb_response,
@@ -115,7 +116,7 @@ def test_router_uses_stable_backend_key_and_no_sync_ssh_override(
         task_id="child-task", session_id="session-a", store=store
     )
 
-    assert key == "execution-backend:cnb-a"
+    assert key == f"execution-backend:cnb-a:session:{_session_key_hash('session-a')}"
     assert captured["task_id"] == key
     assert captured["overrides"] == {
         "env_type": "ssh",

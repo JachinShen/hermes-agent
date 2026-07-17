@@ -12,6 +12,7 @@ from tools.execution_backends import (
     BackendRecord,
     BackendStore,
     BackendError,
+    _session_key_hash,  # noqa: PLC2701
     is_execution_backends_enabled,
     maybe_resolve_execution_task_id,
     resolve_execution_task_id,
@@ -117,13 +118,13 @@ def test_non_environment_tool_returns_unchanged_even_when_cnb_selected(
 
 
 def test_cnb_routing_produces_backend_qualified_key(store: BackendStore) -> None:
-    """When a CNB backend is active, resolve returns execution-backend:<id>."""
+    """When a CNB backend is active, resolve returns execution-backend:<id>:session:<16hex>."""
     store.create_backend(_running_cnb("my-backend", host="ssh.example"))
     store.set_current("session-a", "my-backend")
     key = resolve_execution_task_id(
         task_id="task-a", session_id="session-a", store=store
     )
-    assert key == "execution-backend:my-backend"
+    assert key == f"execution-backend:my-backend:session:{_session_key_hash('session-a')}"
 
 
 def test_cnb_routing_registers_ssh_overrides(store: BackendStore, monkeypatch) -> None:
@@ -143,7 +144,7 @@ def test_cnb_routing_registers_ssh_overrides(store: BackendStore, monkeypatch) -
         task_id="child-task", session_id="session-a", store=store
     )
 
-    assert key == "execution-backend:cnb-a"
+    assert key == f"execution-backend:cnb-a:session:{_session_key_hash('session-a')}"
     assert captured["task_id"] == key
     assert captured["overrides"] == {
         "env_type": "ssh",
@@ -194,8 +195,8 @@ def test_two_sessions_can_have_different_backends(store: BackendStore) -> None:
     key_b = resolve_execution_task_id(
         task_id="t", session_id="session-b", store=store
     )
-    assert key_a == "execution-backend:cnb-a"
-    assert key_b == "execution-backend:cnb-b"
+    assert key_a == f"execution-backend:cnb-a:session:{_session_key_hash('session-a')}"
+    assert key_b == f"execution-backend:cnb-b:session:{_session_key_hash('session-b')}"
 
 
 # =========================================================================
