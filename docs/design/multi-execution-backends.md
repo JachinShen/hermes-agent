@@ -369,9 +369,9 @@ python -m pytest tests/tools/test_execution_backend_security.py -v --tb=short
 python -m pytest tests/tools/test_backend_delete_cleanup.py -v --tb=short
 ```
 
-All tests use `tmp_path` for `BackendStore`, injectable `CNBCLIAdapter` runners
-(no real CLI, no network), and deterministic time for `BackendLeaseMonitor`.
-No test suite touches the network or requires CNB credentials.
+The core tests listed above use `tmp_path` for `BackendStore`, injectable
+`CNBCLIAdapter` runners (no real CLI or network), and deterministic time for
+`BackendLeaseMonitor`. These tests do not require CNB credentials.
 
 ### Test characteristics
 
