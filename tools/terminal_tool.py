@@ -1067,7 +1067,10 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 #
 # This is never exposed to the model -- only infrastructure code calls it.
 # Thread-safe because each task_id is unique per rollout.
+# RLock protects compound read-modify-write sequences (register → resolve →
+# clear) when concurrent sibling subagents execute in parallel.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
+_task_env_overrides_lock = threading.RLock()
 
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
@@ -1138,7 +1141,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    with _task_env_overrides_lock:
+        _task_env_overrides[task_id] = overrides
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1168,7 +1172,8 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    with _task_env_overrides_lock:
+        _task_env_overrides.pop(task_id, None)
     clear_session_cwd(task_id)
 
 
@@ -1200,15 +1205,16 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
-        if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
+    with _task_env_overrides_lock:
+        if task_id and task_id in _task_env_overrides:
+            overrides = _task_env_overrides[task_id]
+            if set(overrides.keys()) & _ISOLATION_KEYS:
+                return task_id
     return "default"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
-    """Return the env overrides for *task_id*, raw key first then collapsed.
+    """Return a copy of the env overrides for *task_id*, raw key first then collapsed.
 
     ``register_task_env_overrides`` writes under the *raw* task/session id, but
     a CWD-only override collapses (:func:`_resolve_container_task_id`) to the
@@ -1218,13 +1224,18 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     read the raw id FIRST and only fall back to the collapsed container id, or
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
+
+    Returns a *copy* of the overrides dict so callers cannot mutate the shared
+    internal registry.
     """
     raw = task_id or "default"
-    return (
-        _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
-        or {}
-    )
+    with _task_env_overrides_lock:
+        overrides = (
+            _task_env_overrides.get(raw)
+            or _task_env_overrides.get(_resolve_container_task_id(raw))
+            or {}
+        )
+        return dict(overrides)
 
 
 _TASK_ENV_CONFIG_KEYS = frozenset({

@@ -78,7 +78,18 @@ WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 def _backend_id_from_task_id(task_id: str) -> str:
     prefix = "execution-backend:"
-    return task_id[len(prefix):] if str(task_id).startswith(prefix) else "local"
+    task_str = str(task_id)
+    if not task_str.startswith(prefix):
+        return "local"
+    # Strip the ``execution-backend:`` prefix to get the remainder.
+    remainder = task_str[len(prefix) :]
+    # New format: ``<backend-id>:session:<hash>`` — extract backend ID
+    # (before the ``:session:`` separator).
+    session_marker = ":session:"
+    if session_marker in remainder:
+        return remainder[: remainder.index(session_marker)]
+    # Old format: ``<backend-id>``
+    return remainder
 
 
 def format_uptime_short(seconds: int) -> str:

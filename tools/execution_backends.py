@@ -7,6 +7,7 @@ an environment task key for tools that touch a filesystem or run commands.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -428,6 +429,16 @@ def _session_key(session_id: str | None, task_id: str | None) -> str:
     return str(session_id or task_id or "default")
 
 
+def _session_key_hash(session_key: str) -> str:
+    """Return first 16 hex chars of SHA-256 of *session_key*.
+
+    Used to build a stable, non-reversible session tag for CNB execution
+    keys.  16 hex chars (64 bits of entropy) is enough to avoid collisions
+    across concurrent sessions without leaking the raw session/task ID.
+    """
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16]
+
+
 def resolve_execution_task_id(
     *,
     task_id: str | None,
@@ -448,7 +459,9 @@ def resolve_execution_task_id(
     if not record.ssh_host or not record.ssh_user:
         raise BackendError(f"backend {record.id} has no usable SSH coordinates")
 
-    execution_key = f"execution-backend:{record.id}"
+    sk = _session_key(session_id, task_id)
+    session_tag = _session_key_hash(sk)
+    execution_key = f"execution-backend:{record.id}:session:{session_tag}"
     from tools.terminal_tool import register_task_env_overrides
 
     register_task_env_overrides(
