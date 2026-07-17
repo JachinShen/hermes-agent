@@ -417,6 +417,34 @@ def is_execution_backends_enabled() -> bool:
 _store_cache: dict[Path, BackendStore] = {}
 _store_cache_lock = threading.Lock()
 
+# Per-backend lifecycle RLock registry.
+#
+# ``backend_tool(delete)`` and ``resolve_execution_task_id`` hold the same
+# per-backend lock so that (a) delete's status→deleting → stop → retire →
+# clear → DB-delete sequence is atomic with respect to any concurrent resolver
+# for the same backend, and (b) the resolver re-reads binding/status inside
+# the lock and refuses to register overrides for a backend whose status is no
+# longer ``running``.
+#
+# Lock granularity is per-backend — other backends are never blocked.
+# Locks persist in the registry so that the same backend ID always reuses
+# the same lock object.  This prevents an old thread that already holds the
+# lock from racing with a freshly rebuilt backend (e.g. delete followed by
+# create-with-same-id) — creating a fresh lock per call would not provide
+# this safety.
+_backend_lifecycle_locks: dict[str, threading.RLock] = {}
+_backend_lifecycle_locks_lock = threading.Lock()
+
+
+def _get_backend_lifecycle_lock(backend_id: str) -> threading.RLock:
+    """Return (or create) the per-backend RLock for *backend_id*."""
+    with _backend_lifecycle_locks_lock:
+        lock = _backend_lifecycle_locks.get(backend_id)
+        if lock is None:
+            lock = threading.RLock()
+            _backend_lifecycle_locks[backend_id] = lock
+        return lock
+
 
 def get_backend_store() -> BackendStore:
     path = get_hermes_home() / "execution_backends.db"
@@ -448,9 +476,25 @@ def resolve_execution_task_id(
     session_id: str | None,
     store: BackendStore | None = None,
 ) -> str:
-    """Resolve and prepare the environment key for the session's backend."""
+    """Resolve and prepare the environment key for the session's backend.
+
+    After reading the initial binding the backend's **lifecycle lock** is
+    acquired so that a concurrent ``backend_tool(delete)`` cannot slip in
+    between the status check and the override registration.  Inside the lock
+    the binding and status are re-read:
+
+    * If the session's binding switched to ``local`` → return the original
+      *task_id* unchanged.
+    * If the binding switched to a *different* backend → raise
+      ``BackendError`` so the caller (``maybe_resolve_execution_task_id``)
+      can safely retry.
+    * If the backend's status is no longer ``running`` (e.g. ``deleting``) →
+      raise ``BackendError`` so the caller does not route to a vanishing
+      workspace.
+    """
     backend_store = store or get_backend_store()
-    record = backend_store.get_current(_session_key(session_id, task_id))
+    sk = _session_key(session_id, task_id)
+    record = backend_store.get_current(sk)
     if record.id == "local":
         return str(task_id or "default")
     if record.status != "running":
@@ -462,24 +506,52 @@ def resolve_execution_task_id(
     if not record.ssh_host or not record.ssh_user:
         raise BackendError(f"backend {record.id} has no usable SSH coordinates")
 
-    sk = _session_key(session_id, task_id)
     session_tag = _session_key_hash(sk)
     execution_key = f"execution-backend:{record.id}:session:{session_tag}"
-    from tools.terminal_tool import register_task_env_overrides
 
-    register_task_env_overrides(
-        execution_key,
-        {
-            "env_type": "ssh",
-            "cwd": record.cwd or "/workspace",
-            "ssh_host": record.ssh_host,
-            "ssh_user": record.ssh_user,
-            "ssh_port": record.ssh_port,
-            "ssh_key": record.ssh_key,
-            "ssh_persistent": True,
-            "ssh_sync_hermes_home": False,
-        },
-    )
+    # ── Late-registration race guard ─────────────────────────────────
+    # Acquire the backend's lifecycle lock and re-read the binding + status.
+    # If a concurrent delete set status→deleting between get_current and
+    # here, we detect it and refuse to register.
+    lifecycle_lock = _get_backend_lifecycle_lock(record.id)
+    with lifecycle_lock:
+        # Re-read the session binding — it may have changed.
+        current_record = backend_store.get_current(sk)
+        if current_record.id == "local":
+            return str(task_id or "default")
+        if current_record.id != record.id:
+            # Session was re-bound to a different backend while we were
+            # resolving — safe retry.
+            raise BackendError(
+                f"backend changed from {record.id} to {current_record.id} "
+                "during resolution; retry"
+            )
+        if current_record.status != "running":
+            raise BackendError(
+                f"backend {record.id} is not ready (status={current_record.status})"
+            )
+        if not current_record.ssh_host or not current_record.ssh_user:
+            raise BackendError(
+                f"backend {record.id} has no usable SSH coordinates"
+            )
+
+        # Everything still looks good — register the overrides.
+        from tools.terminal_tool import register_task_env_overrides
+
+        register_task_env_overrides(
+            execution_key,
+            {
+                "env_type": "ssh",
+                "cwd": current_record.cwd or "/workspace",
+                "ssh_host": current_record.ssh_host,
+                "ssh_user": current_record.ssh_user,
+                "ssh_port": current_record.ssh_port,
+                "ssh_key": current_record.ssh_key,
+                "ssh_persistent": True,
+                "ssh_sync_hermes_home": False,
+            },
+        )
+
     return execution_key
 
 
@@ -790,53 +862,51 @@ def backend_tool(
         backend_id = _validate_backend_id(backend_id)
         record = backend_store.get_backend(backend_id)
 
-        # Step 1: fail-closed — set status to ``deleting`` so concurrent
-        # routing attempts (get_current) raise BackendError instead of
-        # routing to a vanishing workspace.
-        original_status = record.status
-        backend_store.update_backend_status(backend_id, "deleting")
+        # Acquire the per-backend lifecycle lock so no concurrent resolver
+        # can register overrides while we dismantle this backend.
+        lifecycle_lock = _get_backend_lifecycle_lock(backend_id)
+        with lifecycle_lock:
+            # Step 1: fail-closed — set status to ``deleting`` so concurrent
+            # routing attempts (get_current) raise BackendError instead of
+            # routing to a vanishing workspace.
+            original_status = record.status
+            backend_store.update_backend_status(backend_id, "deleting")
 
-        # Step 2: stop the remote workspace.  On failure, restore the
-        # original status so routing is unblocked, then re-raise — the
-        # DB record, bindings, overrides, and env are fully preserved.
-        if record.driver == "cnb":
-            try:
-                cnb.stop_backend(record)
-            except Exception:
-                backend_store.update_backend_status(
-                    backend_id, original_status
-                )
-                raise
+            # Step 2: stop the remote workspace.  On failure, restore the
+            # original status so routing is unblocked, then re-raise — the
+            # DB record, bindings, overrides, and env are fully preserved.
+            if record.driver == "cnb":
+                try:
+                    cnb.stop_backend(record)
+                except Exception:
+                    backend_store.update_backend_status(
+                        backend_id, original_status
+                    )
+                    raise
 
-        # Step 3: retire this backend's processes in the registry.
-        try:
+            # Step 3: retire this backend's processes in the registry.
+            # The helper swallows individual exceptions internally; any
+            # unexpected programming error here propagates (fail-closed →
+            # DB stays ``deleting`` instead of being fully deleted).
             from tools.process_registry import process_registry
 
             process_registry.retire_backend(backend_id)
-        except Exception:
-            logger.exception(
-                "Failed to retire processes for backend %s", backend_id
-            )
 
-        # Step 4: clean up in-memory terminal_tool state for ALL
-        # execution keys that match this backend (old format
-        # ``execution-backend:<id>`` and new format
-        # ``execution-backend:<id>:session:<hash>``).
-        try:
-            from tools.terminal_tool import (
-                clear_backend_execution_env,
-            )
+            # Step 4: clean up in-memory terminal_tool state for ALL
+            # execution keys that match this backend (old format
+            # ``execution-backend:<id>`` and new format
+            # ``execution-backend:<id>:session:<hash>``).
+            # The helper swallows individual env cleanup exceptions; any
+            # unexpected programming error propagates (fail-closed).
+            from tools.terminal_tool import clear_backend_execution_env
 
             clear_backend_execution_env(backend_id)
-        except Exception:
-            logger.exception(
-                "Failed to clear execution env for backend %s",
-                backend_id,
-            )
 
-        # Step 5: delete from DB — bindings, events, and the record itself.
-        backend_store.delete_backend(backend_id)
+            # Step 5: delete from DB — bindings, events, and the record itself.
+            backend_store.delete_backend(backend_id)
 
+        # Set status to ``deleted`` so the caller sees the final state.
+        record.status = "deleted"
         return _backend_result(
             action=action,
             session_key=session_key,

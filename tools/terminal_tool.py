@@ -1182,24 +1182,34 @@ _EXECUTION_BACKEND_PREFIX = "execution-backend:"
 
 
 def _execution_backend_keys(backend_id: str) -> list[str]:
-    """Return all ``_task_env_overrides`` / ``_active_environments`` keys
-    that match *backend_id*, handling both the old flat key format
-    ``execution-backend:<backend_id>`` and the new session-scoped format
+    """Return all ``_task_env_overrides`` / ``_active_environments`` / other
+    tracking-map keys that match *backend_id*, handling both the old flat key
+    format ``execution-backend:<backend_id>`` and the new session-scoped format
     ``execution-backend:<backend_id>:session:<hash>``.
 
-    Uses a strict suffix/segment check to **avoid** matching a shorter
-    backend_id that happens to be a prefix of another (e.g. ``cnb-a``
-    must not match ``cnb-aa`` or ``cnb-ab``).
+    Only the new format with the literal colon-separated segment ``session:``
+    followed by exactly 16 lowercase hex characters is accepted.  Arbitrary
+    colon suffixes (``execution-backend:<id>:foo``) are **not** matched.
+
+    Also scans ``_last_activity`` and ``_creation_locks`` so that keys only
+    present in those maps (e.g. after partial cleanup or mid-creation) are
+    found and cleaned up by ``clear_backend_execution_env``.
     """
+    _NEW_FORMAT_SUFFIX = re.compile(r"^session:[0-9a-f]{16}$")
+
     matched: list[str] = []
-    # Scan both tracking dicts (same keys are used in both).
+    # Scan ALL tracking dicts so a key that only lives in one (e.g.
+    # ``_last_activity`` or ``_creation_locks``) is still found.
     all_keys: set[str] = set()
     with _task_env_overrides_lock:
         all_keys.update(_task_env_overrides.keys())
     with _env_lock:
         all_keys.update(_active_environments.keys())
+        all_keys.update(_last_activity.keys())
     with _session_cwd_lock:
         all_keys.update(_session_cwd.keys())
+    with _creation_locks_lock:
+        all_keys.update(_creation_locks.keys())
 
     for key in all_keys:
         if not key.startswith(_EXECUTION_BACKEND_PREFIX):
@@ -1212,9 +1222,13 @@ def _execution_backend_keys(backend_id: str) -> list[str]:
             if remainder == backend_id:
                 matched.append(key)
         else:
-            # New format: ``<backend-id>:session:<hash>`` — match the
-            # backend-id segment exactly.
-            if remainder[:colon] == backend_id:
+            # New format: must have ``:session:<16-hex-hash>`` segment.
+            # First verify the backend-id prefix matches exactly.
+            if remainder[:colon] != backend_id:
+                continue
+            # Then validate the suffix is exactly ``:session:<16-hex>``.
+            suffix = remainder[colon + 1:]  # everything after ``<backend-id>:``
+            if _NEW_FORMAT_SUFFIX.fullmatch(suffix):
                 matched.append(key)
 
     return matched
