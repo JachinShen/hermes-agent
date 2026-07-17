@@ -1197,8 +1197,16 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
+    # Resolve per-task overrides (e.g. execution-backend:cnb-a → env_type=ssh)
+    # so execute_code routes to the correct sandbox even when the global
+    # TERMINAL_ENV is local (#61852).
+    from tools.terminal_tool import (
+        _get_env_config, _docker_has_host_access,
+        apply_task_env_overrides, resolve_task_overrides,
+    )
+    _env_config = apply_task_env_overrides(
+        _get_env_config(), resolve_task_overrides(task_id),
+    )
     env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
