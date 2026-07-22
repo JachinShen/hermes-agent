@@ -9490,13 +9490,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if _north_action and _north_action.get("kind") == "ask_user":
                                 _required = _north_action.get("required_action") or {}
                                 _requests = _required.get("pending_requests") or _required.get("questions") or []
-                                _first = _requests[0] if isinstance(_requests, list) and _requests else {}
-                                _answer = {
-                                    "questionIndex": 0,
-                                    "header": (_first.get("header") or _first.get("prompt") or "Question 1") if isinstance(_first, dict) else "Question 1",
-                                    "type": (_first.get("type") or "text") if isinstance(_first, dict) else "text",
-                                    "value": _pending_clarify.response or _raw_clarify_reply,
-                                }
+                                if not isinstance(_requests, list) or not _requests:
+                                    _requests = [{}]
+                                _raw_lines = [line.strip() for line in _raw_clarify_reply.splitlines() if line.strip()]
+                                _numbered_answers: dict[int, str] = {}
+                                for _line in _raw_lines:
+                                    _match = re.match(r"^(\d+)\s*[.):-]\s*(.*)$", _line)
+                                    if _match:
+                                        _numbered_answers[int(_match.group(1)) - 1] = _match.group(2).strip()
+                                _answer_values = (
+                                    [_numbered_answers.get(index, "") for index in range(len(_requests))]
+                                    if _numbered_answers
+                                    else [_raw_clarify_reply] + [""] * (len(_requests) - 1)
+                                )
+                                _answers = []
+                                for _index, (_request, _value) in enumerate(zip(_requests, _answer_values)):
+                                    _request = _request if isinstance(_request, dict) else {}
+                                    _answer = {
+                                        "questionIndex": _index,
+                                        "header": _request.get("header") or _request.get("prompt") or f"Question {_index + 1}",
+                                        "type": _request.get("type") or "text",
+                                        "value": _value,
+                                    }
+                                    if _request.get("type") == "choice" and _request.get("options"):
+                                        _answer["selectedOptions"] = [
+                                            _option_index for _option_index, _option in enumerate(_request["options"])
+                                            if str(_option.get("label") if isinstance(_option, dict) else _option).casefold() == _value.casefold()
+                                        ]
+                                    _answers.append(_answer)
                                 _resume_consumer = None
                                 _resume_stream_task = None
                                 _resume_adapter = self._adapter_for_source(source)
@@ -9530,7 +9551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata_extra={
                                         "ask_user_response": {
                                             "tool_call_id": str(_north_action["tool_call_id"]),
-                                            "answers": [_answer],
+                                            "answers": _answers,
                                         }
                                     },
                                 )
