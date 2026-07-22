@@ -19899,6 +19899,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "requires_action": result.get("requires_action", False),
+                    "required_action": result.get("required_action"),
+                    "status": result.get("status"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -20015,6 +20018,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "requires_action": result.get("requires_action", False),
+                "required_action": result.get("required_action"),
+                "status": result.get("status"),
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
