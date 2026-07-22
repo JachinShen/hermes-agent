@@ -9563,8 +9563,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             await asyncio.wait_for(_resume_stream_task, timeout=5.0)
                                         except (asyncio.TimeoutError, asyncio.CancelledError):
                                             _resume_stream_task.cancel()
-                                north_actions.pop(_quick_key)
-                                _clarify_mod.clear_session(_quick_key)
+                                _required_next = _resume_result.get("required_action") or {}
+                                _next_type = _required_next.get("type") or _required_next.get("action_type")
+                                _next_action_id = _required_next.get("action_id") or _required_next.get("tool_call_id")
+                                if _resume_result.get("requires_action") and _next_action_id:
+                                    north_actions.pop(_quick_key)
+                                    _clarify_mod.clear_session(_quick_key)
+                                    north_actions.register(_quick_key, {
+                                        "kind": "ask_user" if _next_type == "ask_user" else ("permission" if _next_type in {"permission_request", "permission"} else "action"),
+                                        "invocation_id": _resume_result.get("north_invocation_id"),
+                                        "tool_call_id": _next_action_id,
+                                        "required_action": _required_next,
+                                        "runtime": _north_action["runtime"],
+                                        "hermes_session_id": _north_action.get("hermes_session_id"),
+                                        "context_prompt": _north_action.get("context_prompt"),
+                                        "source": source,
+                                        "event_message_id": _north_action.get("event_message_id"),
+                                    })
+                                    if _next_type == "ask_user":
+                                        _next_requests = _required_next.get("pending_requests") or _required_next.get("questions") or []
+                                        _next_first = _next_requests[0] if isinstance(_next_requests, list) and _next_requests else _required_next
+                                        _next_question = str(_next_first.get("prompt") or _next_first.get("question") or "North Coder is asking for more information.") if isinstance(_next_first, dict) else str(_next_first)
+                                        _next_choices = _next_first.get("options") or _next_first.get("choices") if isinstance(_next_first, dict) else None
+                                        _clarify_mod.register(
+                                            f"north:{_next_action_id}",
+                                            _quick_key,
+                                            _next_question,
+                                            [str(item.get("label") if isinstance(item, dict) else item) for item in _next_choices] if _next_choices else None,
+                                        )
+                                else:
+                                    north_actions.pop(_quick_key)
+                                    _clarify_mod.clear_session(_quick_key)
                                 return _resume_result.get("final_response", "")
                         except Exception as exc:
                             logger.exception("Failed to resume North ask_user action")
