@@ -147,7 +147,27 @@ class NorthCoderRuntime:
 
         text = "".join(full_response)
         status = str(terminal.get("status") or "completed")
-        # NexAU can emit a synthetic "No response content or tool calls"
+        # North 0.3.3 may emit an ask_user tool result that says it is
+        # waiting, without persisting a resumable requires_action invocation.
+        # Do not synthesize a pause in that case: the answer endpoint would
+        # reject it with required_action_not_found. Surface the mismatch as a
+        # failed bridge turn until the backend exposes a real action state.
+        if status != "requires_action":
+            _tool_events = terminal.get("tools", []) or []
+            _ask_user_waiting = any(
+                event.get("type") == "tool_call_start"
+                and str(event.get("toolCallName") or event.get("tool_name") or "") == "ask_user"
+                for event in _tool_events
+            ) and any(
+                event.get("type") == "tool_call_result"
+                and "waiting for user" in str(event.get("content") or "").lower()
+                for event in _tool_events
+            )
+            if _ask_user_waiting:
+                status = "error"
+                terminal["status"] = status
+                terminal["error"] = "North emitted an ask_user wait result without a resumable requires_action invocation"
+        requires_action = status == "requires_action"
         # error after a terminal tool (notably complete_task) already returned
         # visible content. Hermes treats that tool result as the turn result;
         # preserve it instead of converting a successful turn into silence.
@@ -269,6 +289,54 @@ class NorthCoderRuntime:
                 if response.status >= 400:
                     raise RuntimeError(f"North ask_user answer failed ({response.status}): {body[:500]}")
                 return json.loads(body) if body else {}
+
+    async def resume_ask_user_turn(
+        self,
+        invocation_id: str,
+        answers: list[dict[str, Any]],
+        *,
+        session_key: str,
+        hermes_session_id: str,
+        source: Any = None,
+        on_delta: Optional[DeltaCallback] = None,
+        on_event: Optional[EventCallback] = None,
+    ) -> dict[str, Any]:
+        """Submit a pending ask_user action and consume the resumed invocation."""
+        import aiohttp
+
+        accepted = await self.answer_ask_user(invocation_id, answers)
+        resumed_id = str(accepted.get("invocation_id") or invocation_id)
+        conversation_id = await self._conversation_id(session_key)
+        full_response: list[str] = []
+        terminal: dict[str, Any] = {"status": "completed", "tools": []}
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds, sock_read=self.config.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            try:
+                ws = await self._connect_events(client, conversation_id)
+            except Exception:
+                ws = None
+            if ws is not None:
+                try:
+                    terminal = await self._consume_events(ws, full_response, on_delta, on_event)
+                finally:
+                    await ws.close()
+            else:
+                terminal = await self._poll_result(client, resumed_id, full_response, on_event)
+        text = "".join(full_response)
+        status = str(terminal.get("status") or "completed")
+        return {
+            "final_response": text or ("⏸️ North Coder is waiting for user action." if status == "requires_action" else "(No response from North Coder)"),
+            "messages": [{"role": "user", "content": "[Ask User Response]"}, {"role": "assistant", "content": text}],
+            "api_calls": 1,
+            "tools": terminal.get("tools", []),
+            "completed": status == "completed",
+            "interrupted": status in {"cancelled", "canceled"},
+            "failed": status in {"failed", "error"},
+            "requires_action": status == "requires_action",
+            "required_action": terminal.get("required_action"),
+            "north_conversation_id": conversation_id,
+            "north_invocation_id": resumed_id,
+        }
 
     def resolve_permission_sync(self, invocation_id: str, tool_call_id: str, decision: str) -> dict[str, Any]:
         return asyncio.run(self.resolve_permission(invocation_id, tool_call_id, decision))

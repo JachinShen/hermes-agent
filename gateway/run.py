@@ -9540,21 +9540,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             initial_reply_to_id=_north_action.get("event_message_id"),
                                         )
                                         _resume_stream_task = asyncio.create_task(_resume_consumer.run())
-                                    _resume_result = await _north_action["runtime"].run_turn(
-                                        message=_raw_clarify_reply,
+                                    _resume_result = await _north_action["runtime"].resume_ask_user_turn(
+                                        str(_north_action.get("invocation_id") or ""),
+                                        _answers,
                                         session_key=_quick_key,
                                         hermes_session_id=str(_north_action.get("hermes_session_id") or _quick_key),
-                                        context_prompt=str(_north_action.get("context_prompt") or ""),
                                         source=source,
-                                        event_message_id=_north_action.get("event_message_id"),
                                         on_delta=_resume_consumer.on_delta if _resume_consumer else None,
-                                        metadata_extra={
-                                        "ask_user_response": {
-                                            "tool_call_id": str(_north_action["tool_call_id"]),
-                                            "answers": _answers,
-                                        }
-                                    },
-                                )
+                                    )
                                 finally:
                                     if _resume_consumer is not None:
                                         _resume_consumer.finish()
