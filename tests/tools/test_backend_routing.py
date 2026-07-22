@@ -620,6 +620,9 @@ def test_execute_code_local_path_still_works_without_overrides() -> None:
         "tools.code_execution_tool._load_config",
         return_value={"timeout": 300, "max_tool_calls": 50},
     ), patch(
+        "tools.code_execution_tool._resolve_child_python",
+        return_value="python",
+    ), patch(
         "tools.approval.check_execute_code_guard",
         return_value={"approved": True},
     ):

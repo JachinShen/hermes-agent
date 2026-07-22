@@ -89,3 +89,5 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "用户偏好中文" in prompt_text
     assert str(home / "skills" / "demo") in yaml_text
     assert "sk-" not in yaml_text
+    for tool_name in ("apply_patch", "save_memory", "complete_task", "ToolSearch"):
+        assert f"name: {tool_name}" in yaml_text

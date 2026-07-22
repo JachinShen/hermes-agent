@@ -29,9 +29,14 @@ current Hermes profile's prompt context (`SOUL.md`, `memories/MEMORY.md`, and
 It intentionally does not copy `.env`, auth, sessions, logs, caches, or
 provider credentials.
 
-Memory compatibility is currently a startup snapshot, not full Hermes memory
-parity: `MEMORY.md` and `USER.md` are included in `system_prompt.md`, but North
-is not yet given Hermes' dynamic memory search/write/replace/delete tools.
+Memory compatibility now uses the NexAU session/task builtin surface:
+`save_memory`, `complete_task`, and `ToolSearch` are exported in the artifact,
+and North/NexAU owns their runtime execution. The initial `MEMORY.md` and
+`USER.md` are also included in `system_prompt.md`.
+
+This is runtime capability parity, but not yet storage parity with Hermes'
+local memory database/files: writes made by North are owned by North's session
+backend and are not automatically synchronized back to Hermes `~/.hermes/memories`.
 
 The Hermes default profile is exported locally to:
 

@@ -15,13 +15,21 @@ _CORE_NORTH_TOOLS = (
     ("read_file", "file.read_file"),
     ("write_file", "file.write_file"),
     ("replace", "file.replace"),
-    ("search_file_content", "file.search_content"),
+    ("apply_patch", "file.apply_patch"),
+    ("multiedit", "file.multiedit"),
+    ("glob", "file.glob"),
     ("list_directory", "file.list_directory"),
+    ("read_many_files", "file.read_many_files"),
+    ("search_file_content", "file.search_content"),
     ("run_shell_command", "shell.run_command"),
+    ("background_task_manage", "shell.background_task_manage"),
     ("web_search", "web.search"),
     ("web_read", "web.read"),
     ("write_todos", "session.write_todos"),
     ("ask_user", "session.ask_user"),
+    ("complete_task", "session.complete_task"),
+    ("save_memory", "session.save_memory"),
+    ("ToolSearch", "system.tool_search"),
 )
 
 
