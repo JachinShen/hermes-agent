@@ -97,3 +97,44 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "sk-" not in yaml_text
     for tool_name in ("apply_patch", "save_memory", "complete_task"):
         assert f"name: {tool_name}" in yaml_text
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_resolves_permission_and_answers_ask_user(tmp_path, aiohttp_server):
+    seen: list[tuple[str, dict]] = []
+
+    async def invocation(request):
+        return web.json_response({
+            "status": "requires_action",
+            "conversation_id": "conv-action",
+            "required_action": {"action_id": "ask-1"},
+        })
+
+    async def permission(request):
+        seen.append(("permission", await request.json()))
+        return web.json_response({"invocation_id": "inv-resumed", "status": "running"})
+
+    async def answer(request):
+        seen.append(("answer", await request.json()))
+        return web.json_response({"invocation_id": "inv-answer", "status": "running"})
+
+    app = web.Application()
+    app.router.add_get("/api/invocations/inv-action", invocation)
+    app.router.add_post("/api/invocations/inv-permission/permissions/tool-1/resolve", permission)
+    app.router.add_post("/api/conversations/conv-action/messages", answer)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    assert await runtime.resolve_permission("inv-permission", "tool-1", "allow_once") == {
+        "invocation_id": "inv-resumed", "status": "running"
+    }
+    assert await runtime.answer_ask_user("inv-action", [{"header": "Mode", "value": "safe"}]) == {
+        "invocation_id": "inv-answer", "status": "running"
+    }
+    assert seen[0] == ("permission", {"decision": "allow_once"})
+    answer_payload = seen[1][1]
+    assert answer_payload["metadata"]["ask_user_response"]["tool_call_id"] == "ask-1"
+    assert answer_payload["metadata"]["ask_user_response"]["answers"][0]["type"] == "text"

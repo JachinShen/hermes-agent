@@ -197,6 +197,82 @@ class NorthCoderRuntime:
         except Exception:
             logger.exception("Failed to cancel North invocation %s", invocation_id)
 
+    async def resolve_permission(
+        self,
+        invocation_id: str,
+        tool_call_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        """Resolve a North permission pause and return the resume response."""
+        if decision not in {"allow", "allow_once", "deny"}:
+            raise ValueError(f"unsupported permission decision: {decision}")
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as client:
+            async with client.post(
+                f"{self.config.base_url}/api/invocations/{invocation_id}/permissions/{tool_call_id}/resolve",
+                json={"decision": decision},
+            ) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"North permission resolve failed ({response.status}): {body[:500]}")
+                return json.loads(body) if body else {}
+
+    async def answer_ask_user(
+        self,
+        invocation_id: str,
+        answers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Submit Hermes-compatible ask_user answers and resume the run."""
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as client:
+            async with client.get(f"{self.config.base_url}/api/invocations/{invocation_id}") as response:
+                invocation_body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"North invocation lookup failed ({response.status}): {invocation_body[:500]}")
+                invocation = json.loads(invocation_body)
+            if invocation.get("status") != "requires_action":
+                raise RuntimeError(f"North invocation is not waiting for action: {invocation.get('status')}")
+            conversation_id = str(invocation.get("conversation_id") or "")
+            action = invocation.get("required_action") or {}
+            tool_call_id = str(action.get("action_id") or action.get("tool_call_id") or "")
+            if not conversation_id or not tool_call_id:
+                raise RuntimeError("North requires_action response lacks conversation_id or action_id")
+            lines = ["[Ask User Response]"]
+            normalized: list[dict[str, Any]] = []
+            for index, answer in enumerate(answers):
+                item = dict(answer)
+                item.setdefault("questionIndex", index)
+                item.setdefault("header", f"Question {index + 1}")
+                item.setdefault("type", "text")
+                item.setdefault("value", "")
+                normalized.append(item)
+                lines.append(f"{index + 1}. {item['header']}: {item['value']}")
+            payload = {
+                "content": "\n".join(lines),
+                "metadata": {
+                    "ask_user_response": {
+                        "tool_call_id": tool_call_id,
+                        "answers": normalized,
+                    }
+                },
+            }
+            async with client.post(
+                f"{self.config.base_url}/api/conversations/{conversation_id}/messages",
+                json=payload,
+            ) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"North ask_user answer failed ({response.status}): {body[:500]}")
+                return json.loads(body) if body else {}
+
+    def resolve_permission_sync(self, invocation_id: str, tool_call_id: str, decision: str) -> dict[str, Any]:
+        return asyncio.run(self.resolve_permission(invocation_id, tool_call_id, decision))
+
+    def answer_ask_user_sync(self, invocation_id: str, answers: list[dict[str, Any]]) -> dict[str, Any]:
+        return asyncio.run(self.answer_ask_user(invocation_id, answers))
+
     async def _connect_events(self, client: Any, conversation_id: str) -> Any:
         ws_url = self.config.base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
         return await client.ws_connect(f"{ws_url}/ws/conversation/{conversation_id}", heartbeat=30)
