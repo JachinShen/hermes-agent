@@ -30,9 +30,10 @@ It intentionally does not copy `.env`, auth, sessions, logs, caches, or
 provider credentials.
 
 Memory compatibility now uses the NexAU session/task builtin surface:
-`save_memory`, `complete_task`, and `ToolSearch` are exported in the artifact,
-and North/NexAU owns their runtime execution. The initial `MEMORY.md` and
-`USER.md` are also included in `system_prompt.md`.
+`save_memory` and `complete_task` are exported in the artifact. `ToolSearch` is
+conditional in NexAU and is deliberately **not** declared in `tools:`; NexAU
+mounts it when required. The initial `MEMORY.md` and `USER.md` are also
+included in `system_prompt.md`.
 
 This is runtime capability parity, but not yet storage parity with Hermes'
 local memory database/files: writes made by North are owned by North's session
@@ -82,3 +83,25 @@ server changes.
 This is a protocol adapter, not a North runtime fork. North-specific tool
 catalog bindings and UI-only product tools remain North-owned. Hermes-specific
 plugins are not silently translated.
+
+## Hermes parity matrix
+
+| Hermes-native capability | North bridge behavior | Status |
+|---|---|---|
+| Channel/session/thread routing | Hermes owns routing; one durable North conversation per `session_key` | aligned |
+| Final text response | North text deltas are assembled and returned through the normal Gateway result path | aligned |
+| Streaming edits | North text deltas feed Hermes `GatewayStreamConsumer` when platform streaming is enabled | aligned |
+| Tool progress/history | North tool events are forwarded to Gateway observers and retained in the result | aligned at protocol level |
+| Cancellation / `/stop` | Active invocation is tracked and cancelled through North REST; TUI cancellation is cross-thread safe | aligned on primary path |
+| Permission approval | North `requires_action` / permission events are surfaced as a paused result | bridge present; Hermes approval UI resume still pending |
+| `ask_user` | North required-action payload is preserved | bridge present; Gateway answer transport still pending |
+| Queued follow-up / busy input | North owns conversation queue; Hermes busy-input policy is not yet mapped one-for-one | partial |
+| Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` remains North-owned | partial; no Hermes file sync |
+| Plugins / hooks | Hermes Gateway hooks still run around the turn; plugin-specific agent callbacks are not translated | partial |
+| Images / attachments | Source metadata and workdir are passed; provider-specific binary attachment parity remains North-dependent | partial |
+| Session reset / branch / compress | North conversation lifecycle is authoritative; Hermes slash semantics do not automatically map to every North control-plane verb | partial |
+| Native fallback | `/runtime native` remains available for TUI session-local switching | aligned |
+
+“Aligned” means the user-visible primary path is exercised by tests or real
+smoke. “Partial” is intentional: the adapter does not claim semantics that
+North does not expose through its REST/WebSocket contract.

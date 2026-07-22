@@ -17608,25 +17608,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        # North Coder is an alternate agent engine, not a model provider. Keep
-        # this dispatch above the existing AIAgent path so the Gateway retains
-        # channel/session/delivery behavior while North owns the agent loop.
-        try:
-            from gateway.north_coder_runtime import runtime_from_raw
-            north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
-        except Exception:
-            logger.exception("Failed to initialize North Coder runtime adapter")
-            north_runtime = None
-        if north_runtime is not None:
-            return await north_runtime.run_turn(
-                message=message,
-                session_key=session_key or session_id,
-                hermes_session_id=session_id,
-                context_prompt=context_prompt,
-                source=source,
-                event_message_id=event_message_id,
-            )
-
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -19724,7 +19705,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                _north_runtime = None
+                try:
+                    from gateway.north_coder_runtime import runtime_from_raw
+                    _north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+                except Exception:
+                    logger.exception("Failed to initialize North Coder runtime adapter")
+                if _north_runtime is not None:
+                    def _north_event_sync(_event: dict[str, Any]) -> None:
+                        _kind = str(_event.get("type") or "")
+                        if _kind == "tool_call_start":
+                            progress_callback(
+                                "tool.started",
+                                tool_name=_event.get("toolCallName") or _event.get("tool_name"),
+                                args=_event,
+                            )
+                        elif _kind in {"tool_call_result", "tool_call_end"}:
+                            progress_callback(
+                                "tool.completed",
+                                tool_name=_event.get("toolCallName") or _event.get("tool_name"),
+                                preview=str(_event.get("content") or "")[:240],
+                                args=_event,
+                            )
+                    result = asyncio.run(_north_runtime.run_turn(
+                        message=_api_run_message if isinstance(_api_run_message, str) else message,
+                        session_key=session_key or session_id,
+                        hermes_session_id=session_id,
+                        context_prompt=combined_ephemeral,
+                        source=source,
+                        event_message_id=event_message_id,
+                        on_delta=_stream_delta_cb,
+                        on_event=_north_event_sync,
+                    ))
+                else:
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

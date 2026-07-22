@@ -25,12 +25,15 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         assert payload["content"] == "hello"
         assert payload["agent_profile_id"] == "builtin:general"
         assert payload["model_id"] == "ng-test-model"
+        assert payload["metadata"]["hermes_context_prompt"] == "channel context"
         await request.app["ws"].send_json({"type": "history_ref"})
         await request.app["ws"].send_json({"type": "replay_start"})
         await request.app["ws"].send_json({"type": "text_message_content", "messageId": "old-message", "delta": "stale answer"})
         await request.app["ws"].send_json({"type": "run_finished", "messageId": "old-message"})
         await request.app["ws"].send_json({"type": "replay_end"})
         await request.app["ws"].send_json({"type": "run_started", "messageId": "m1"})
+        await request.app["ws"].send_json({"type": "tool_call_start", "toolCallId": "tool-1", "toolCallName": "read_file"})
+        await request.app["ws"].send_json({"type": "tool_call_result", "toolCallId": "tool-1", "content": "ok"})
         await request.app["ws"].send_json({"type": "text_message_content", "messageId": "m1", "delta": "hello back"})
         await request.app["ws"].send_json({"type": "run_finished", "messageId": "m1"})
         return web.json_response({"invocation_id": "inv-test", "status": "running"})
@@ -62,9 +65,12 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         message="hello",
         session_key="slack:C:thread",
         hermes_session_id="hermes-session",
+        context_prompt="channel context",
     )
 
     assert result["final_response"] == "hello back"
+    assert len(result["tools"]) == 2
+    assert result["status"] == "completed"
     assert result["north_conversation_id"] == conversation_id
     assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
         "slack:C:thread": conversation_id

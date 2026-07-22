@@ -64,6 +64,9 @@ class NorthCoderRuntime:
         self.hermes_home = hermes_home
         self.state_file = Path(config.state_file) if config.state_file else hermes_home / "north_coder_conversations.json"
         self._state_lock = asyncio.Lock()
+        # Process-local ownership for cross-thread Gateway/TUI interrupts.
+        self._active_invocations: dict[str, str] = {}
+        self._active_lock = asyncio.Lock()
 
     async def run_turn(
         self,
@@ -93,6 +96,7 @@ class NorthCoderRuntime:
                 "platform": getattr(getattr(source, "platform", None), "value", None),
                 "chat_id": getattr(source, "chat_id", None),
                 "thread_id": getattr(source, "thread_id", None),
+                "hermes_context_prompt": context_prompt or None,
             },
         }
         if self.config.model_id:
@@ -104,6 +108,7 @@ class NorthCoderRuntime:
 
         full_response: list[str] = []
         invocation_id: Optional[str] = None
+        terminal: dict[str, Any] = {"status": "completed", "tools": []}
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as client:
             ws = None
@@ -121,22 +126,49 @@ class NorthCoderRuntime:
                     raise RuntimeError(f"North message request failed ({response.status}): {body[:500]}")
                 accepted = json.loads(body) if body else {}
                 invocation_id = accepted.get("invocation_id")
+                if invocation_id:
+                    async with self._active_lock:
+                        self._active_invocations[session_key] = str(invocation_id)
 
             if ws is not None:
                 try:
-                    await self._consume_events(ws, full_response, on_delta, on_event)
+                    terminal = await self._consume_events(ws, full_response, on_delta, on_event)
                 finally:
                     await ws.close()
             elif invocation_id:
-                await self._poll_result(client, invocation_id, full_response, on_event)
+                terminal = await self._poll_result(client, invocation_id, full_response, on_event)
+
+        async with self._active_lock:
+            if self._active_invocations.get(session_key) == str(invocation_id or ""):
+                self._active_invocations.pop(session_key, None)
 
         text = "".join(full_response)
+        status = str(terminal.get("status") or "completed")
+        # NexAU can emit a synthetic "No response content or tool calls"
+        # error after a terminal tool (notably complete_task) already returned
+        # visible content. Hermes treats that tool result as the turn result;
+        # preserve it instead of converting a successful turn into silence.
+        if not text and status in {"completed", "error", "failed"}:
+            for tool_event in reversed(terminal.get("tools", [])):
+                if tool_event.get("type") != "tool_call_result" or tool_event.get("isError"):
+                    continue
+                candidate = tool_event.get("content") or tool_event.get("result")
+                if isinstance(candidate, str) and candidate:
+                    text = candidate
+                    status = "completed"
+                    break
+        requires_action = status == "requires_action"
         return {
-            "final_response": text or "(No response from North Coder)",
+            "final_response": text or ("⏸️ North Coder is waiting for user action." if requires_action else "(No response from North Coder)"),
             "messages": [{"role": "user", "content": message}, {"role": "assistant", "content": text}],
             "api_calls": 1,
-            "tools": [],
-            "completed": True,
+            "tools": terminal.get("tools", []),
+            "completed": status == "completed",
+            "interrupted": status in {"cancelled", "canceled"},
+            "failed": status in {"failed", "error"},
+            "requires_action": requires_action,
+            "status": status,
+            "required_action": terminal.get("required_action"),
             "session_id": hermes_session_id,
             "north_conversation_id": conversation_id,
             "north_invocation_id": invocation_id,
@@ -152,6 +184,19 @@ class NorthCoderRuntime:
                 if response.status >= 400:
                     raise RuntimeError(f"North cancel failed ({response.status}): {(await response.text())[:300]}")
 
+    def active_invocation(self, session_key: str) -> Optional[str]:
+        return self._active_invocations.get(session_key)
+
+    def cancel_session(self, session_key: str) -> None:
+        """Best-effort synchronous cancellation hook for Gateway/TUI threads."""
+        invocation_id = self.active_invocation(session_key)
+        if not invocation_id:
+            return
+        try:
+            asyncio.run(self.cancel(invocation_id))
+        except Exception:
+            logger.exception("Failed to cancel North invocation %s", invocation_id)
+
     async def _connect_events(self, client: Any, conversation_id: str) -> Any:
         ws_url = self.config.base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
         return await client.ws_connect(f"{ws_url}/ws/conversation/{conversation_id}", heartbeat=30)
@@ -162,8 +207,9 @@ class NorthCoderRuntime:
         full_response: list[str],
         on_delta: Optional[DeltaCallback],
         on_event: Optional[EventCallback],
-    ) -> None:
+    ) -> dict[str, Any]:
         replaying = False
+        terminal: dict[str, Any] = {"status": "completed", "tools": []}
         while True:
             item = await ws.receive()
             if item.type.name in {"CLOSED", "CLOSE", "CLOSING"}:
@@ -190,12 +236,25 @@ class NorthCoderRuntime:
                     full_response.append(delta)
                     if on_delta:
                         on_delta(delta)
+            if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
+                terminal.setdefault("tools", []).append(event)
+            if kind in {"requires_action", "run_requires_action", "invocation_requires_action", "permission_request", "ask_user"}:
+                terminal["status"] = "requires_action"
+                terminal["required_action"] = event.get("required_action") or event
             if kind in {"run_finished", "run_error", "run_start_failure", "cancelled"}:
-                if kind != "run_finished" and event.get("message"):
-                    raise RuntimeError(str(event["message"]))
+                if terminal.get("status") != "requires_action":
+                    terminal["status"] = {
+                        "run_finished": "completed",
+                        "run_error": "error",
+                        "run_start_failure": "error",
+                        "cancelled": "cancelled",
+                    }[kind]
+                if event.get("error"):
+                    terminal["error"] = event["error"]
                 break
+        return terminal
 
-    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback]) -> None:
+    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback]) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.timeout_seconds
         while time.monotonic() < deadline:
             async with client.get(f"{self.config.base_url}/api/invocations/{invocation_id}/result") as response:
@@ -213,8 +272,8 @@ class NorthCoderRuntime:
             status = str(result.get("status") or "")
             if status in {"completed", "failed", "cancelled", "error"} or result.get("finished"):
                 if status not in {"completed", ""}:
-                    raise RuntimeError(str(result.get("error") or status))
-                return
+                    return result
+                return result
             await asyncio.sleep(0.25)
         raise TimeoutError(f"North invocation {invocation_id} timed out")
 
@@ -271,9 +330,19 @@ class NorthCoderRuntime:
 
 
 
+_RUNTIME_CACHE: dict[tuple[str, str, str], "NorthCoderRuntime"] = {}
+
+
 def runtime_from_raw(raw: dict[str, Any], hermes_home: Path) -> Optional[NorthCoderRuntime]:
     config = NorthCoderRuntimeConfig.from_raw(raw)
-    return NorthCoderRuntime(config, hermes_home) if config else None
+    if not config:
+        return None
+    key = (config.base_url, config.workspace_id, str(Path(config.state_file) if config.state_file else hermes_home / "north_coder_conversations.json"))
+    runtime = _RUNTIME_CACHE.get(key)
+    if runtime is None:
+        runtime = NorthCoderRuntime(config, hermes_home)
+        _RUNTIME_CACHE[key] = runtime
+    return runtime
 
 
 class NorthCoderTUIAgent:
@@ -312,11 +381,7 @@ class NorthCoderTUIAgent:
 
     def interrupt(self) -> None:
         self._interrupted = True
-        if self._last_invocation_id:
-            try:
-                asyncio.run(self.runtime.cancel(self._last_invocation_id))
-            except Exception:
-                logger.exception("Failed to cancel North invocation from TUI")
+        self.runtime.cancel_session(self.session_key)
 
     def clear_interrupt(self) -> None:
         self._interrupted = False
