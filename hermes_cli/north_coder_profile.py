@@ -29,7 +29,6 @@ _CORE_NORTH_TOOLS = (
     ("ask_user", "session.ask_user"),
     ("complete_task", "session.complete_task"),
     ("save_memory", "session.save_memory"),
-    ("ToolSearch", "system.tool_search"),
 )
 
 
