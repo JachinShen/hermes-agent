@@ -93,7 +93,7 @@ plugins are not silently translated.
 | Streaming edits | North text deltas feed Hermes `GatewayStreamConsumer` when platform streaming is enabled | aligned |
 | Tool progress/history | North tool events are forwarded to Gateway observers and retained in the result | aligned at protocol level |
 | Cancellation / `/stop` | Active invocation is tracked and cancelled through North REST; TUI cancellation is cross-thread safe | aligned on primary path |
-| Permission approval | North `requires_action` / permission events are surfaced as a paused result | bridge present; Hermes approval UI resume still pending |
+| Permission approval | North `requires_action` / permission events are surfaced as a paused result; pending permission actions are registered under the Hermes session key and `/approve`/`/deny` resolve the North invocation | primary permission route aligned |
 | `ask_user` | North required-action payload is preserved | bridge present; Gateway answer transport still pending |
 | Queued follow-up / busy input | North owns conversation queue; Hermes busy-input policy is not yet mapped one-for-one | partial |
 | Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` remains North-owned | partial; no Hermes file sync |

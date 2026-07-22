@@ -19750,6 +19750,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            if result.get("requires_action") and _north_runtime is not None:
+                try:
+                    from tools import north_actions
+                    _required = result.get("required_action") or {}
+                    _action_id = _required.get("action_id") or _required.get("tool_call_id")
+                    if _action_id:
+                        north_actions.register(session_key or session_id, {
+                            "kind": "permission" if (_required.get("type") or _required.get("action_type")) in {"permission_request", "permission"} else "action",
+                            "invocation_id": result.get("north_invocation_id") or _north_runtime.active_invocation(session_key or session_id),
+                            "tool_call_id": _action_id,
+                            "required_action": _required,
+                            "runtime": _north_runtime,
+                        })
+                except Exception:
+                    logger.exception("Failed to register North pending action")
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
