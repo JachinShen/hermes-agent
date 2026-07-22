@@ -28,9 +28,9 @@ DeltaCallback = Callable[[str], None]
 class NorthCoderRuntimeConfig:
     base_url: str = "http://127.0.0.1:8848"
     workspace_id: str = "home-default"
-    agent_profile_id: str = "builtin:general"
+    agent_profile_id: str = "hermes:default"
     agent_yaml_path: Optional[str] = None
-    model_id: Optional[str] = None
+    model_id: Optional[str] = "ng-gpt-5.6-sol"
     timeout_seconds: float = 1800.0
     state_file: Optional[str] = None
 
@@ -163,6 +163,7 @@ class NorthCoderRuntime:
         on_delta: Optional[DeltaCallback],
         on_event: Optional[EventCallback],
     ) -> None:
+        replaying = False
         while True:
             item = await ws.receive()
             if item.type.name in {"CLOSED", "CLOSE", "CLOSING"}:
@@ -172,11 +173,17 @@ class NorthCoderRuntime:
             if item.type.name != "TEXT":
                 continue
             event = json.loads(item.data)
+            kind = event.get("type")
+            if kind == "replay_start":
+                replaying = True
+            elif kind == "replay_end":
+                replaying = False
             if on_event:
                 result = on_event(event)
                 if asyncio.iscoroutine(result):
                     await result
-            kind = event.get("type")
+            if replaying or kind in {"history_ref", "replay_start", "replay_end"}:
+                continue
             if kind == "text_message_content":
                 delta = str(event.get("delta") or "")
                 if delta:

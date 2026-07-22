@@ -25,6 +25,11 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         assert payload["content"] == "hello"
         assert payload["agent_profile_id"] == "builtin:general"
         assert payload["model_id"] == "ng-test-model"
+        await request.app["ws"].send_json({"type": "history_ref"})
+        await request.app["ws"].send_json({"type": "replay_start"})
+        await request.app["ws"].send_json({"type": "text_message_content", "messageId": "old-message", "delta": "stale answer"})
+        await request.app["ws"].send_json({"type": "run_finished", "messageId": "old-message"})
+        await request.app["ws"].send_json({"type": "replay_end"})
         await request.app["ws"].send_json({"type": "run_started", "messageId": "m1"})
         await request.app["ws"].send_json({"type": "text_message_content", "messageId": "m1", "delta": "hello back"})
         await request.app["ws"].send_json({"type": "run_finished", "messageId": "m1"})
@@ -47,6 +52,7 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
     runtime = NorthCoderRuntime(
         NorthCoderRuntimeConfig(
             base_url=f"http://{server.host}:{server.port}",
+            agent_profile_id="builtin:general",
             agent_yaml_path="/tmp/hermes-agent.yaml",
             model_id="ng-test-model",
         ),

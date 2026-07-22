@@ -12,8 +12,9 @@ agent_runtime:
   kind: north_coder
   base_url: http://127.0.0.1:8848
   workspace_id: home-default
-  agent_profile_id: builtin:general
-  agent_yaml_path: /path/to/generated/agent.yaml
+  agent_profile_id: hermes:default
+  model_id: ng-gpt-5.6-sol
+  agent_yaml_path: /Users/jachinshen/.hermes/north-coder-profile/agent.yaml
 ```
 
 The adapter creates one North conversation per Hermes `session_key`, persists
@@ -28,13 +29,18 @@ current Hermes profile's prompt context (`SOUL.md`, `memories/MEMORY.md`, and
 It intentionally does not copy `.env`, auth, sessions, logs, caches, or
 provider credentials.
 
-The active `cnb-preview` profile was exported locally to:
+Memory compatibility is currently a startup snapshot, not full Hermes memory
+parity: `MEMORY.md` and `USER.md` are included in `system_prompt.md`, but North
+is not yet given Hermes' dynamic memory search/write/replace/delete tools.
+
+The Hermes default profile is exported locally to:
 
 ```text
-~/.hermes/profiles/cnb-preview/north-coder-profile/agent.yaml
+~/.hermes/north-coder-profile/agent.yaml
 ```
 
-and configured to use North at port `8848`.
+It is registered in North as `hermes:default`; the old `cnb-preview` North
+profile is not used.
 
 The TUI can switch the runtime without restarting:
 
@@ -57,7 +63,7 @@ checkout:
 cd /Users/jachinshen/north-coder-workspace/hermes-agent-north-runtime
 unset HERMES_TUI_DIR
 HERMES_MAIN_CHECKOUT=/Users/jachinshen/.hermes/hermes-agent \
-  python -m hermes_cli.main --profile cnb-preview --tui --dev
+  python -m hermes_cli.main --profile default --tui --dev
 ```
 
 If the canonical checkout's Python environment is unavailable, run the same
