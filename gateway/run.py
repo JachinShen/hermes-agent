@@ -17608,6 +17608,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        # North Coder is an alternate agent engine, not a model provider. Keep
+        # this dispatch above the existing AIAgent path so the Gateway retains
+        # channel/session/delivery behavior while North owns the agent loop.
+        try:
+            from gateway.north_coder_runtime import runtime_from_raw
+            north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+        except Exception:
+            logger.exception("Failed to initialize North Coder runtime adapter")
+            north_runtime = None
+        if north_runtime is not None:
+            return await north_runtime.run_turn(
+                message=message,
+                session_key=session_key or session_id,
+                hermes_session_id=session_id,
+                context_prompt=context_prompt,
+                source=source,
+                event_message_id=event_message_id,
+            )
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,

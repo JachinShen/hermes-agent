@@ -1560,6 +1560,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if current.get("runtime_override"):
+                    kw["runtime_override"] = current["runtime_override"]
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -4794,6 +4796,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    runtime_override: str | None = None,
     platform_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
@@ -4805,9 +4808,19 @@ def _make_agent(
     if synthetic is not None:
         return synthetic
 
-    from run_agent import AIAgent
+    cfg = _load_cfg()
+    try:
+        from gateway.north_coder_runtime import tui_agent_from_raw
+        if runtime_override != "native":
+            north_agent = tui_agent_from_raw(cfg, Path(_hermes_home), session_id or key)
+            if north_agent is not None:
+                north_agent.runtime_override = runtime_override or "ncoder"
+                logger.info("Using North Coder runtime for TUI session %s", session_id or key)
+                return north_agent
+    except Exception:
+        logger.exception("Failed to initialize North Coder runtime for TUI")
 
-    # MCP tool discovery runs in a background daemon thread at startup so a
+    from run_agent import AIAgent
     # dead server can't freeze the shell.  The agent snapshots its tool list
     # once here and never re-reads it, so briefly wait for in-flight discovery
     # to land before building — bounded, so a slow/dead server still can't
@@ -13570,6 +13583,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "models",
         "prompt",
         "rename",
+        "runtime",
         "status",
         "usage",
     }
@@ -13751,9 +13765,62 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
+def _format_live_runtime_output(session: dict) -> str:
+    agent = session.get("agent")
+    runtime = getattr(agent, "runtime_override", None)
+    if not runtime:
+        runtime = "ncoder" if getattr(agent, "provider", "") == "north_coder" else "native"
+    return f"Current agent runtime: {runtime}"
+
+
+def _switch_session_runtime(sid: str, session: dict, target: str) -> str:
+    target = target.strip().lower()
+    if target not in {"native", "ncoder"}:
+        return "Usage: /runtime [native|ncoder]"
+    if session.get("running"):
+        return "session busy — /interrupt the current turn before switching runtime"
+    current = session.get("agent")
+    current_runtime = getattr(current, "runtime_override", None)
+    if not current_runtime:
+        current_runtime = "ncoder" if getattr(current, "provider", "") == "north_coder" else "native"
+    if current_runtime == target:
+        return f"Agent runtime already: {target}"
+    try:
+        tokens = _set_session_context(session["session_key"])
+        try:
+            new_agent = _make_agent(
+                sid,
+                session["session_key"],
+                session_id=session["session_key"],
+                session_db=_get_db(),
+                model_override=session.get("model_override"),
+                runtime_override=target,
+                platform_override=_session_source(session),
+            )
+        finally:
+            _clear_session_context(tokens)
+        if current is not None and hasattr(current, "close"):
+            current.close()
+        session["runtime_override"] = target
+        session["agent"] = new_agent
+        _restart_slash_worker(sid, session)
+        _wire_callbacks(sid)
+        _emit("session.info", sid, _session_info(new_agent, session))
+        return f"Switched agent runtime: {target}"
+    except Exception as exc:
+        logger.exception("Failed to switch TUI agent runtime to %s", target)
+        return f"runtime switch failed: {exc}"
+
+
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
+    if name == "runtime":
+        if session is None:
+            return "No active session."
+        if not arg.strip():
+            return _format_live_runtime_output(session)
+        return _switch_session_runtime(sid, session, arg)
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
