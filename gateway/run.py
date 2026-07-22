@@ -19745,8 +19745,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
                 try:
-                    from tools.clarify_gateway import clear_session as _clear_clarify_session
-                    _clear_clarify_session(_approval_session_key)
+                    _keep_north_ask_user = bool(
+                        isinstance(locals().get("result"), dict)
+                        and locals()["result"].get("requires_action")
+                        and ((locals()["result"].get("required_action") or {}).get("type") == "ask_user")
+                    )
+                    if not _keep_north_ask_user:
+                        from tools.clarify_gateway import clear_session as _clear_clarify_session
+                        _clear_clarify_session(_approval_session_key)
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
@@ -19757,12 +19763,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _action_id = _required.get("action_id") or _required.get("tool_call_id")
                     if _action_id:
                         north_actions.register(session_key or session_id, {
-                            "kind": "permission" if (_required.get("type") or _required.get("action_type")) in {"permission_request", "permission"} else "action",
+                            "kind": "ask_user" if (_required.get("type") or _required.get("action_type")) == "ask_user" else ("permission" if (_required.get("type") or _required.get("action_type")) in {"permission_request", "permission"} else "action"),
                             "invocation_id": result.get("north_invocation_id") or _north_runtime.active_invocation(session_key or session_id),
                             "tool_call_id": _action_id,
                             "required_action": _required,
                             "runtime": _north_runtime,
                         })
+                        if (_required.get("type") or _required.get("action_type")) == "ask_user":
+                            from tools import clarify_gateway
+                            _requests = _required.get("pending_requests") or _required.get("questions") or []
+                            _first = _requests[0] if isinstance(_requests, list) and _requests else _required
+                            _question = str(_first.get("prompt") or _first.get("question") or "North Coder is asking for more information.") if isinstance(_first, dict) else str(_first)
+                            _choices = _first.get("options") or _first.get("choices") if isinstance(_first, dict) else None
+                            clarify_gateway.register(
+                                f"north:{_action_id}",
+                                session_key or session_id,
+                                _question,
+                                [str(item.get("label") if isinstance(item, dict) else item) for item in _choices] if _choices else None,
+                            )
                 except Exception:
                     logger.exception("Failed to register North pending action")
             result_holder[0] = result
