@@ -26,6 +26,7 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         assert payload["agent_profile_id"] == "builtin:general"
         assert payload["model_id"] == "ng-test-model"
         assert payload["metadata"]["hermes_context_prompt"] == "channel context"
+        assert payload["metadata"]["ask_user_response"]["tool_call_id"] == "ask-1"
         await request.app["ws"].send_json({"type": "history_ref"})
         await request.app["ws"].send_json({"type": "replay_start"})
         await request.app["ws"].send_json({"type": "text_message_content", "messageId": "old-message", "delta": "stale answer"})
@@ -66,6 +67,7 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         session_key="slack:C:thread",
         hermes_session_id="hermes-session",
         context_prompt="channel context",
+        metadata_extra={"ask_user_response": {"tool_call_id": "ask-1"}},
     )
 
     assert result["final_response"] == "hello back"

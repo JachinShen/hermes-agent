@@ -79,6 +79,7 @@ class NorthCoderRuntime:
         event_message_id: Optional[str] = None,
         on_delta: Optional[DeltaCallback] = None,
         on_event: Optional[EventCallback] = None,
+        metadata_extra: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         import aiohttp
 
@@ -99,6 +100,8 @@ class NorthCoderRuntime:
                 "hermes_context_prompt": context_prompt or None,
             },
         }
+        if metadata_extra:
+            payload["metadata"].update(metadata_extra)
         if self.config.model_id:
             payload["model_id"] = self.config.model_id
         if self.config.agent_yaml_path:

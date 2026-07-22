@@ -9483,6 +9483,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
                     )
+                    if _pending_clarify.clarify_id.startswith("north:"):
+                        try:
+                            from tools import north_actions
+                            _north_action = north_actions.get(_quick_key)
+                            if _north_action and _north_action.get("kind") == "ask_user":
+                                _required = _north_action.get("required_action") or {}
+                                _requests = _required.get("pending_requests") or _required.get("questions") or []
+                                _first = _requests[0] if isinstance(_requests, list) and _requests else {}
+                                _answer = {
+                                    "questionIndex": 0,
+                                    "header": (_first.get("header") or _first.get("prompt") or "Question 1") if isinstance(_first, dict) else "Question 1",
+                                    "type": (_first.get("type") or "text") if isinstance(_first, dict) else "text",
+                                    "value": _pending_clarify.response or _raw_clarify_reply,
+                                }
+                                _resume_result = await _north_action["runtime"].run_turn(
+                                    message=_raw_clarify_reply,
+                                    session_key=_quick_key,
+                                    hermes_session_id=str(_north_action.get("hermes_session_id") or _quick_key),
+                                    context_prompt=str(_north_action.get("context_prompt") or ""),
+                                    source=source,
+                                    event_message_id=_north_action.get("event_message_id"),
+                                    metadata_extra={
+                                        "ask_user_response": {
+                                            "tool_call_id": str(_north_action["tool_call_id"]),
+                                            "answers": [_answer],
+                                        }
+                                    },
+                                )
+                                north_actions.pop(_quick_key)
+                                _clarify_mod.clear_session(_quick_key)
+                                return _resume_result.get("final_response", "")
+                        except Exception as exc:
+                            logger.exception("Failed to resume North ask_user action")
+                            return f"North ask_user resume failed: {exc}"
                     # The clarify callback pauses the platform typing/status
                     # indicator while waiting so Slack users can type their
                     # answer. The active agent resumes as soon as this reply
@@ -19768,6 +19802,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "tool_call_id": _action_id,
                             "required_action": _required,
                             "runtime": _north_runtime,
+                            "hermes_session_id": session_id,
+                            "context_prompt": combined_ephemeral,
+                            "source": source,
+                            "event_message_id": event_message_id,
                         })
                         if (_required.get("type") or _required.get("action_type")) == "ask_user":
                             from tools import clarify_gateway
