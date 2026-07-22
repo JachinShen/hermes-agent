@@ -9497,20 +9497,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "type": (_first.get("type") or "text") if isinstance(_first, dict) else "text",
                                     "value": _pending_clarify.response or _raw_clarify_reply,
                                 }
-                                _resume_result = await _north_action["runtime"].run_turn(
-                                    message=_raw_clarify_reply,
-                                    session_key=_quick_key,
-                                    hermes_session_id=str(_north_action.get("hermes_session_id") or _quick_key),
-                                    context_prompt=str(_north_action.get("context_prompt") or ""),
-                                    source=source,
-                                    event_message_id=_north_action.get("event_message_id"),
-                                    metadata_extra={
+                                _resume_consumer = None
+                                _resume_stream_task = None
+                                _resume_adapter = self._adapter_for_source(source)
+                                try:
+                                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                                    from gateway.config import StreamingConfig
+                                    _resume_scfg = getattr(getattr(self, "config", None), "streaming", None) or StreamingConfig()
+                                    if _resume_adapter and _resume_scfg.enabled and _resume_scfg.transport != "off":
+                                        _resume_consumer = GatewayStreamConsumer(
+                                            adapter=_resume_adapter,
+                                            chat_id=source.chat_id,
+                                            config=StreamConsumerConfig(
+                                                edit_interval=_resume_scfg.edit_interval,
+                                                buffer_threshold=_resume_scfg.buffer_threshold,
+                                                cursor=_resume_scfg.cursor,
+                                                transport=_resume_scfg.transport or "edit",
+                                                chat_type=getattr(source, "chat_type", "") or "",
+                                            ),
+                                            metadata=self._thread_metadata_for_source(source, _north_action.get("event_message_id")),
+                                            initial_reply_to_id=_north_action.get("event_message_id"),
+                                        )
+                                        _resume_stream_task = asyncio.create_task(_resume_consumer.run())
+                                    _resume_result = await _north_action["runtime"].run_turn(
+                                        message=_raw_clarify_reply,
+                                        session_key=_quick_key,
+                                        hermes_session_id=str(_north_action.get("hermes_session_id") or _quick_key),
+                                        context_prompt=str(_north_action.get("context_prompt") or ""),
+                                        source=source,
+                                        event_message_id=_north_action.get("event_message_id"),
+                                        on_delta=_resume_consumer.on_delta if _resume_consumer else None,
+                                        metadata_extra={
                                         "ask_user_response": {
                                             "tool_call_id": str(_north_action["tool_call_id"]),
                                             "answers": [_answer],
                                         }
                                     },
                                 )
+                                finally:
+                                    if _resume_consumer is not None:
+                                        _resume_consumer.finish()
+                                    if _resume_stream_task is not None:
+                                        try:
+                                            await asyncio.wait_for(_resume_stream_task, timeout=5.0)
+                                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                                            _resume_stream_task.cancel()
                                 north_actions.pop(_quick_key)
                                 _clarify_mod.clear_session(_quick_key)
                                 return _resume_result.get("final_response", "")
