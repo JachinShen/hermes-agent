@@ -4820,7 +4820,34 @@ def _make_agent(
     try:
         from gateway.north_coder_runtime import tui_agent_from_raw
         if runtime_override != "native":
-            north_agent = tui_agent_from_raw(cfg, Path(_hermes_home), session_id or key)
+            # Lazy factory for background review sidecar host.
+            # Only built when nudge thresholds are met — never per-turn.
+            # Captures the current _make_agent params so the Hermes AIAgent
+            # review host shares the same session identity, model, provider,
+            # reasoning config, etc.
+            def _make_review_host():
+                host = _make_agent(
+                    sid, key,
+                    session_id=session_id,
+                    session_db=session_db,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    reasoning_config_override=reasoning_config_override,
+                    service_tier_override=service_tier_override,
+                    platform_override=platform_override,
+                    runtime_override="native",
+                )
+                # Prevent the sidecar host from persisting its own session
+                # snapshot or ending the canonical TUI session.
+                if host is not None:
+                    host._persist_disabled = True
+                    host._end_session_on_close = False
+                return host
+
+            north_agent = tui_agent_from_raw(
+                cfg, Path(_hermes_home), session_id or key,
+                _review_host_factory=_make_review_host,
+            )
             if north_agent is not None:
                 north_agent.runtime_override = runtime_override or "ncoder"
                 logger.info("Using North Coder runtime for TUI session %s", session_id or key)

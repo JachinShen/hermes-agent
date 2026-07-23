@@ -13,7 +13,7 @@ import type {
 } from '../../../gatewayTypes.js'
 import { formatVoiceRecordKey, parseVoiceRecordKey } from '../../../lib/platform.js'
 import { fmtK } from '../../../lib/text.js'
-import type { PanelSection } from '../../../types.js'
+import type { PanelSection, SessionInfo } from '../../../types.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { patchUiState } from '../../uiStore.js'
@@ -114,6 +114,33 @@ export const sessionCommands: SlashCommand[] = [
           )
 
       switchModel()
+    }
+  },
+
+  {
+    help: 'change this session workspace',
+    name: 'cwd',
+    usage: '/cwd <path>',
+    run: (arg, ctx) => {
+      const cwd = arg.trim()
+
+      if (!cwd) {
+        return ctx.transcript.sys('usage: /cwd <path>')
+      }
+
+      if (ctx.session.guardBusySessionSwitch('change workspace')) {
+        return
+      }
+
+      ctx.gateway
+        .rpc<SessionInfo>('session.cwd.set', { cwd, session_id: ctx.sid })
+        .then(
+          ctx.guarded<SessionInfo>(info => {
+            patchUiState({ info })
+            ctx.transcript.sys(`cwd → ${info.cwd || cwd}`)
+          })
+        )
+        .catch(ctx.guardedErr)
     }
   },
 

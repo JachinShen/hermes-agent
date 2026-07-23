@@ -716,7 +716,8 @@ class NorthCoderTUIAgent:
     the external runtime remains async and owns the real conversation state.
     """
 
-    def __init__(self, runtime: NorthCoderRuntime, session_key: str):
+    def __init__(self, runtime: NorthCoderRuntime, session_key: str,
+                 _review_host_factory=None):
         self.runtime = runtime
         self.session_key = session_key
         self.session_id = session_key
@@ -726,6 +727,13 @@ class NorthCoderTUIAgent:
         self.history: list[dict[str, Any]] = []
         self._last_invocation_id: Optional[str] = None
         self._interrupted = False
+        # Lazy factory for the Hermes AIAgent review host.  Only invoked when
+        # nudge thresholds are met — never per-turn — to avoid building a
+        # second runtime on every North foreground turn.
+        self._review_host_factory = _review_host_factory
+        # Cached background review host — built lazily on first threshold met,
+        # then reused across turns until facade.close().
+        self._review_host = None
 
     def run_conversation(self, message: Any, *, conversation_history=None, stream_callback=None,
                          tool_start_callback=None, tool_complete_callback=None,
@@ -778,6 +786,25 @@ class NorthCoderTUIAgent:
         )
         self._last_invocation_id = result.get("north_invocation_id")
         self.history.extend(result.get("messages", []))
+        # TUI server persists ``result["messages"]`` as the canonical Hermes
+        # transcript. North's run result contains only the current exchange,
+        # so return the facade's full history instead of letting the server
+        # overwrite prior turns with the latest pair.
+        result["messages"] = list(self.history)
+        # Schedule background memory/skill review after a successful turn.
+        # This runs as a Hermes sidecar — it does NOT create a North background
+        # conversation.  The canonical transcript (self.history) MUST include
+        # the just-completed exchange so the review sees the full session.
+        if result.get("completed") and not result.get("interrupted") and not result.get("requires_action"):
+            try:
+                self.schedule_background_review(
+                    list(self.history),
+                    result,
+                    background_review_callback=getattr(self, "background_review_callback", None),
+                    memory_notifications=getattr(self, "memory_notifications", "on"),
+                )
+            except Exception:
+                logger.warning("North background review scheduling failed", exc_info=True)
         return result
 
     def interrupt(self) -> None:
@@ -789,9 +816,335 @@ class NorthCoderTUIAgent:
 
     def close(self) -> None:
         """AIAgent compatibility hook; North owns transport cleanup per turn."""
-        return None
+        if self._review_host is not None:
+            try:
+                self._review_host.close()
+            except Exception:
+                pass
+            self._review_host = None
+        with _NORTH_REVIEW_LOCK:
+            _NORTH_REVIEW_STATE.pop(self.session_id, None)
+
+    def schedule_background_review(
+        self,
+        canonical_history: list[dict],
+        north_result: dict,
+        *,
+        background_review_callback=None,
+        memory_notifications: str = "on",
+    ) -> None:
+        """Schedule a Hermes background review after a successful North turn.
+        Uses the lazy review host factory (only built when thresholds are met).
+        Caches the built host for reuse across turns."""
+        def _caching_builder():
+            if self._review_host is None and self._review_host_factory is not None:
+                self._review_host = self._review_host_factory()
+            return self._review_host
+
+        try:
+            schedule_north_background_review(
+                canonical_history=canonical_history,
+                north_result=north_result,
+                session_id=self.session_id,
+                review_host=None,
+                tui_host_builder=_caching_builder,
+                background_review_callback=background_review_callback,
+                memory_notifications=memory_notifications,
+            )
+        except Exception:
+            logger.warning("North background review scheduling failed", exc_info=True)
 
 
-def tui_agent_from_raw(raw: dict[str, Any], hermes_home: Path, session_key: str) -> Optional[NorthCoderTUIAgent]:
+
+def tui_agent_from_raw(
+    raw: dict[str, Any],
+    hermes_home: Path,
+    session_key: str,
+    _review_host_factory=None,
+) -> Optional[NorthCoderTUIAgent]:
     runtime = runtime_from_raw(raw, hermes_home)
-    return NorthCoderTUIAgent(runtime, session_key) if runtime else None
+    return NorthCoderTUIAgent(runtime, session_key, _review_host_factory=_review_host_factory) if runtime else None
+
+
+# ---------------------------------------------------------------------------
+# North background review — Hermes sidecar that runs after every successful
+# North foreground turn and determines whether a memory/skill review should
+# be triggered, reusing the existing agent/background_review infrastructure.
+# ---------------------------------------------------------------------------
+
+# Process-local nudge state keyed by Hermes session_key.
+# Stores last-seen canonical turn counts and accumulated deltas.
+_NORTH_REVIEW_STATE: dict[str, dict] = {}
+_NORTH_REVIEW_LOCK = threading.Lock()
+
+
+def _count_north_tool_iterations(north_tools: list[dict]) -> int:
+    """Count tool iterations from North result tool events.
+
+    Each ``tool_call_start`` event represents one tool iteration.  When
+    ``toolCallId`` / ``tool_call_id`` is present, events are deduplicated so
+    paired start+result events don't double-count.  When absent (some North
+    run formats), each ``tool_call_start`` counts as 1.
+    """
+    seen = set()
+    count = 0
+    for event in north_tools or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "tool_call_start":
+            tcid = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+            if tcid:
+                if tcid not in seen:
+                    seen.add(tcid)
+                    count += 1
+            else:
+                count += 1
+    return count
+
+
+def _count_user_turns(canonical_history: list[dict]) -> int:
+    """Count user-role messages in the canonical transcript."""
+    return sum(
+        1 for m in (canonical_history or [])
+        if isinstance(m, dict) and m.get("role") == "user"
+    )
+
+
+def _north_review_snapshot(
+    canonical_history: list[dict],
+    north_tools: list[dict],
+) -> list[dict]:
+    """Add truthful North tool activity to the review-only transcript.
+
+    North persists user/assistant messages as the Gateway canonical history,
+    while its tool telemetry arrives separately. Native Hermes skill review
+    normally sees assistant ``tool_calls`` followed by ``tool`` messages, so
+    reconstruct that shape for the reviewer without mutating session history.
+    """
+    tool_messages: list[dict] = []
+    started: set[str] = set()
+    for event in north_tools or []:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("type") or "")
+        call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+        if kind == "tool_call_start":
+            if not call_id:
+                call_id = f"north-tool-{len(started) + 1}"
+            if call_id in started:
+                continue
+            started.add(call_id)
+            name = str(event.get("toolCallName") or event.get("tool_name") or "unknown")
+            arguments = event.get("arguments", event.get("args", event.get("input", {})))
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments or {}, ensure_ascii=False, default=str)
+            tool_messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            })
+        elif kind in {"tool_call_result", "tool_call_end"} and call_id in started:
+            content = event.get("content", event.get("result", ""))
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, default=str)
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            })
+
+    snapshot = list(canonical_history)
+    if not tool_messages:
+        return snapshot
+    insert_at = len(snapshot)
+    if snapshot and isinstance(snapshot[-1], dict) and snapshot[-1].get("role") == "assistant":
+        insert_at -= 1
+    snapshot[insert_at:insert_at] = tool_messages
+    return snapshot
+
+
+def schedule_north_background_review(
+    *,
+    canonical_history: list[dict],
+    north_result: dict,
+    session_id: str,
+    review_host: Any = None,
+    tui_host_builder: Optional[Callable[[], Any]] = None,
+    background_review_callback=None,
+    memory_notifications: str = "on",
+) -> None:
+    """Schedule a background memory/skill review after a successful North turn.
+
+    Uses diff-based accumulation: the function stores the *last seen* user-turn
+    count from the canonical transcript and only accumulates the *delta* each
+    call, preventing double-counting when the same history is passed repeatedly.
+    Tool iterations are counted from the North result tool events only (not
+    from canonical transcript tool_calls), since the Hermes native background
+    review path already consumes canonical tool_calls for its own decision.
+
+    When ``review_host`` (a Hermes AIAgent) is provided, the review runs
+    directly via ``host._spawn_background_review`` — the same path Hermes
+    native uses, with full thread context propagation, auxiliary routing,
+    OAuth/live credentials, memory store, approval/tool whitelist, and
+    self-improvement summary delivery. When ``tui_host_builder`` is provided
+    instead (TUI lazy factory), the host is built on demand only when nudge
+    thresholds are met — never per-turn.
+
+    Args:
+        canonical_history: Fully canonical Hermes session transcript
+            (including the just-completed exchange).
+        north_result: result dict from ``NorthCoderRuntime.run_turn``.
+        session_id: Hermes session key for nudge state tracking.
+        review_host: Hermes AIAgent instance (Gateway path).
+        tui_host_builder: Callable returning a Hermes AIAgent (TUI lazy path).
+        background_review_callback: Callback for review summary delivery.
+        memory_notifications: ``"on"``, ``"off"``, or ``"verbose"``.
+    """
+    # Only trigger on successfully completed turns
+    if not north_result.get("completed"):
+        return
+    if north_result.get("interrupted"):
+        return
+    if north_result.get("requires_action"):
+        return
+    if north_result.get("failed"):
+        return
+
+    # Read config for nudge intervals.
+    # Hermes canonical keys (not agent.memory_nudge_interval):
+    #   memory.nudge_interval (default 10)
+    #   skills.creation_nudge_interval (default 10)
+    from hermes_cli.config import DEFAULT_CONFIG, load_config
+    cfg = load_config()
+    mem_cfg = cfg.get("memory", {}) or {}
+    raw_mem = mem_cfg.get("nudge_interval")
+    if raw_mem is None:
+        raw_mem = DEFAULT_CONFIG.get("memory", {}).get("nudge_interval", 10)
+    memory_nudge = int(raw_mem)
+    skills_cfg = cfg.get("skills", {}) or {}
+    raw_skill = skills_cfg.get("creation_nudge_interval")
+    if raw_skill is None:
+        raw_skill = DEFAULT_CONFIG.get("skills", {}).get("creation_nudge_interval", 10)
+    skill_nudge = int(raw_skill)
+
+    # Diff-based counting: compute delta from last-seen canonical counts
+    total_users = _count_user_turns(canonical_history)
+    with _NORTH_REVIEW_LOCK:
+        now = time.time()
+        stale_before = now - 86_400
+        for stale_id, stale_state in list(_NORTH_REVIEW_STATE.items()):
+            if stale_id != session_id and stale_state.get("last_active", 0.0) < stale_before:
+                _NORTH_REVIEW_STATE.pop(stale_id, None)
+        state = _NORTH_REVIEW_STATE.setdefault(session_id, {
+            "accum_user_turns": 0,
+            "accum_tool_iters": 0,
+            "last_seen_user_count": 0,
+            "last_seen_tool_count": 0,
+            "last_active": 0.0,
+        })
+        # Delta = total - last_seen; only the growth since last call counts
+        # First baseline uses modulo so a resumed session with many prior
+        # user turns does not immediately trigger review.
+        old_seen = state.get("last_seen_user_count", 0)
+        if old_seen == 0 and total_users > 0:
+            # First entry: modulo to avoid immediate trigger on session resume
+            if memory_nudge > 0:
+                remainder = total_users % memory_nudge
+                new_user_turns = memory_nudge if remainder == 0 else remainder
+            else:
+                new_user_turns = 0
+        else:
+            new_user_turns = max(0, total_users - old_seen)
+        state["last_seen_user_count"] = total_users
+
+        # Tool iterations: only count current North result tool_call_start events.
+        # Canonical transcript tool_calls are NOT counted here — the Hermes native
+        # review path internally scans the snapshot history for its own decision.
+        north_tools = north_result.get("tools", []) or []
+        new_tool_iters = _count_north_tool_iterations(north_tools)
+
+        # Accumulate
+        state["accum_user_turns"] = state.get("accum_user_turns", 0) + new_user_turns
+        state["accum_tool_iters"] = state.get("accum_tool_iters", 0) + new_tool_iters
+        state["last_active"] = now
+
+        total_user_turns = state["accum_user_turns"]
+        total_tool_iters = state["accum_tool_iters"]
+
+    review_memory = memory_nudge > 0 and total_user_turns >= memory_nudge
+    review_skills = skill_nudge > 0 and total_tool_iters >= skill_nudge
+
+    if not review_memory and not review_skills:
+        return
+
+    # Determine and validate the review host (Hermes AIAgent).
+    host = review_host
+    if host is None and tui_host_builder is not None:
+        try:
+            host = tui_host_builder()
+        except Exception:
+            host = None
+    if host is None:
+        logger.warning(
+            "North background review skipped: no review host available for session %s",
+            session_id,
+        )
+        return
+
+    # Native-style gating on the real host.
+    if review_memory:
+        mem_enabled = bool(getattr(host, "_memory_enabled", False) or
+                           getattr(host, "_user_profile_enabled", False))
+        if not mem_enabled:
+            review_memory = False
+    if review_skills:
+        vt = getattr(host, "valid_tool_names", None)
+        skills_enabled = vt is not None and "skill_manage" in vt
+        if not skills_enabled:
+            review_skills = False
+
+    if not review_memory and not review_skills:
+        return
+
+    # Wire callbacks.
+    if background_review_callback is not None:
+        host.background_review_callback = background_review_callback
+    if memory_notifications:
+        host.memory_notifications = memory_notifications
+
+    # Spawn the background review daemon thread.
+    # The host MUST NOT be closed here — _spawn_background_review only starts
+    # the daemon; the caller (TUIAgent facade or Gateway runner) owns close().
+    try:
+        host._spawn_background_review(
+            messages_snapshot=_north_review_snapshot(
+                canonical_history,
+                north_result.get("tools", []) or [],
+            ),
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
+        with _NORTH_REVIEW_LOCK:
+            if session_id in _NORTH_REVIEW_STATE:
+                if review_memory:
+                    _NORTH_REVIEW_STATE[session_id]["accum_user_turns"] = 0
+                if review_skills:
+                    _NORTH_REVIEW_STATE[session_id]["accum_tool_iters"] = 0
+    except Exception:
+        logger.warning(
+            "North background review failed for session %s", session_id,
+            exc_info=True,
+        )
+
+
+# Exported symbols for the North background review integration
+__all__ = [
+    "_count_north_tool_iterations",
+    "_count_user_turns",
+    "_north_review_snapshot",
+    "schedule_north_background_review",
+]

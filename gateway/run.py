@@ -19911,6 +19911,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.exception("Failed to register North pending action")
             result_holder[0] = result
+            # Schedule background review after successful North foreground turn.
+            if _north_runtime is not None and result.get("completed") and not result.get("interrupted") and not result.get("requires_action"):
+                try:
+                    from gateway.north_coder_runtime import schedule_north_background_review as _schedule_north_bg
+                    _canonical = list(agent_history)
+                    _msgs = result.get("messages", [])
+                    if _msgs:
+                        _canonical.extend(_msgs)
+                    _schedule_north_bg(
+                        canonical_history=_canonical,
+                        north_result=result,
+                        session_id=session_id or session_key or "",
+                        review_host=agent,
+                        background_review_callback=_bg_review_send,
+                        memory_notifications=getattr(agent, "memory_notifications", "on"),
+                    )
+                except Exception:
+                    logger.exception("North background review scheduling failed")
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
