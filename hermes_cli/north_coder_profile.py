@@ -166,7 +166,6 @@ def export_hermes_profile(
         "# Hermes Gateway does not mount remote execution backends into this Profile.",
         "sandbox_config:",
         "  type: local",
-        "  work_dir: ${env.NORTH_CODER_WORKSPACE_ROOT}",
         "",
         "tools:",
     ]

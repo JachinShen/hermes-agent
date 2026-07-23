@@ -139,7 +139,8 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "name: run_shell_command" in yaml_text
     assert "name: background_task_manage" in yaml_text
     assert "sandbox_config:" in yaml_text
-    assert "work_dir: ${env.NORTH_CODER_WORKSPACE_ROOT}" in yaml_text
+    assert "type: local" in yaml_text
+    assert "NORTH_CODER_WORKSPACE_ROOT" not in yaml_text
     assert (agent_yaml.parent / "tools" / "skill_manage.tool.yaml").is_file()
     bridge = (agent_yaml.parent / "custom_tools" / "skill_manage_bridge.py").read_text()
     assert str(home) in bridge
