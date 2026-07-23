@@ -114,9 +114,13 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     home = tmp_path / "profile"
     (home / "memories").mkdir(parents=True)
     (home / "skills" / "demo").mkdir(parents=True)
+    (home / "skills" / ".archive" / "legacy").mkdir(parents=True)
+    (home / "skills" / "demo" / "references" / "old-copy").mkdir(parents=True)
     (home / "config.yaml").write_text("agent:\n  max_turns: 42\n", encoding="utf-8")
     (home / "memories" / "USER.md").write_text("用户偏好中文", encoding="utf-8")
     (home / "skills" / "demo" / "SKILL.md").write_text("# Demo", encoding="utf-8")
+    (home / "skills" / ".archive" / "legacy" / "SKILL.md").write_text("# Legacy", encoding="utf-8")
+    (home / "skills" / "demo" / "references" / "old-copy" / "SKILL.md").write_text("# Old copy", encoding="utf-8")
 
     agent_yaml = export_hermes_profile(home, tmp_path / "north-profile", name="hermes-test")
     yaml_text = agent_yaml.read_text(encoding="utf-8")
@@ -127,6 +131,8 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "api_key" in yaml_text  # placeholder is required by North schema
     assert "用户偏好中文" in prompt_text
     assert str(home / "skills" / "demo") in yaml_text
+    assert ".archive" not in yaml_text
+    assert "old-copy" not in yaml_text
     assert "sk-" not in yaml_text
     for tool_name in ("apply_patch", "save_memory"):
         assert f"name: {tool_name}" in yaml_text

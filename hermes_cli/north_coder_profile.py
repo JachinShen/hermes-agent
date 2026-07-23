@@ -10,6 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import get_hermes_home
+
 
 def _skill_manage_tool_yaml() -> str:
     return """type: tool
@@ -143,7 +146,7 @@ def export_hermes_profile(
     skill_paths = sorted(
         str(path.parent)
         for path in (hermes_home / "skills").rglob("SKILL.md")
-        if path.is_file()
+        if path.is_file() and not is_excluded_skill_path(path)
     ) if (hermes_home / "skills").is_dir() else []
 
     max_context = int(agent_cfg.get("max_context_tokens") or 200_000)
