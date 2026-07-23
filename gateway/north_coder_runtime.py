@@ -274,11 +274,9 @@ class NorthCoderRuntime:
                 lines.append(f"{index + 1}. {item['header']}: {item['value']}")
             payload = {
                 "content": "\n".join(lines),
-                "metadata": {
-                    "ask_user_response": {
-                        "tool_call_id": tool_call_id,
-                        "answers": normalized,
-                    }
+                "ask_user_response": {
+                    "tool_call_id": tool_call_id,
+                    "answers": normalized,
                 },
             }
             async with client.post(
