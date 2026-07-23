@@ -76,22 +76,6 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
-def _backend_id_from_task_id(task_id: str) -> str:
-    prefix = "execution-backend:"
-    task_str = str(task_id)
-    if not task_str.startswith(prefix):
-        return "local"
-    # Strip the ``execution-backend:`` prefix to get the remainder.
-    remainder = task_str[len(prefix) :]
-    # New format: ``<backend-id>:session:<hash>`` — extract backend ID
-    # (before the ``:session:`` separator).
-    session_marker = ":session:"
-    if session_marker in remainder:
-        return remainder[: remainder.index(session_marker)]
-    # Old format: ``<backend-id>``
-    return remainder
-
-
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -109,7 +93,6 @@ class ProcessSession:
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
-    backend_id: str = "local"                   # Backend that owns the process
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -726,7 +709,6 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
-            backend_id=_backend_id_from_task_id(task_id),
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
@@ -867,7 +849,6 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
-            backend_id=_backend_id_from_task_id(task_id),
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
@@ -1753,7 +1734,6 @@ class ProcessRegistry:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
                 "uptime_seconds": int(time.time() - s.started_at),
                 "status": "exited" if s.exited else "running",
-                "backend_id": getattr(s, "backend_id", "local"),
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
             # Flag processes surfaced only because they share the gateway
@@ -1775,47 +1755,6 @@ class ProcessRegistry:
                 entry["detached"] = True
             result.append(entry)
         return result
-
-    # ----- Backend lifecycle (for execution_backends delete) -----
-
-    def retire_backend(self, backend_id: str) -> int:
-        """Mark all running sessions owned by *backend_id* as exited.
-
-        Iterates the running-process map for sessions whose ``backend_id``
-        matches *backend_id*, marks them ``exited`` with exit_code ``None``
-        and completion_reason ``backend_lost``, then moves them to finished.
-        Does NOT send SSH kill signals — the workspace was already stopped
-        by the caller (adapter.workspace-stop) or will be stopped after this
-        call returns.
-
-        The finished list retains the original ``backend_id`` so callers
-        that read the process list can still see which backend owned each
-        retired session.
-
-        Returns the number of sessions that were retired.
-        """
-        retired = 0
-        with self._lock:
-            target_ids = [
-                sid
-                for sid, s in list(self._running.items())
-                if hasattr(s, "backend_id") and s.backend_id == backend_id
-                and not s.exited
-            ]
-        for sid in target_ids:
-            session = self.get(sid)
-            if session is None:
-                continue
-            with session._lock:
-                if session.exited:
-                    continue
-                session.exited = True
-                session.exit_code = None
-                session.completion_reason = "backend_lost"
-                session.termination_source = "backend.delete"
-            self._move_to_finished(session)
-            retired += 1
-        return retired
 
     # ----- Session/Task Queries (for gateway integration) -----
 
@@ -1959,7 +1898,6 @@ class ProcessRegistry:
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
-                            "backend_id": getattr(s, "backend_id", "local"),
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
@@ -2032,7 +1970,6 @@ class ProcessRegistry:
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
-                backend_id=entry.get("backend_id") or _backend_id_from_task_id(entry.get("task_id", "")),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,

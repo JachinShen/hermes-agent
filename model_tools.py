@@ -1257,15 +1257,6 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
-            # Route only environment-sensitive handlers. Middleware, approvals,
-            # observability, and conversation history retain the original task
-            # and session identifiers so switching backends never rewrites the
-            # prompt/history control plane.
-            from tools.execution_backends import maybe_resolve_execution_task_id
-
-            dispatch_task_id = maybe_resolve_execution_task_id(
-                function_name, task_id=task_id, session_id=session_id
-            )
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
@@ -1273,7 +1264,7 @@ def handle_function_call(
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
-                        task_id=dispatch_task_id,
+                        task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
@@ -1281,7 +1272,7 @@ def handle_function_call(
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
-                        task_id=dispatch_task_id,
+                        task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )

@@ -1067,10 +1067,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 #
 # This is never exposed to the model -- only infrastructure code calls it.
 # Thread-safe because each task_id is unique per rollout.
-# RLock protects compound read-modify-write sequences (register → resolve →
-# clear) when concurrent sibling subagents execute in parallel.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
-_task_env_overrides_lock = threading.RLock()
 
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
@@ -1141,8 +1138,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    with _task_env_overrides_lock:
-        _task_env_overrides[task_id] = overrides
+    _task_env_overrides[task_id] = overrides
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1172,133 +1168,8 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    with _task_env_overrides_lock:
-        _task_env_overrides.pop(task_id, None)
+    _task_env_overrides.pop(task_id, None)
     clear_session_cwd(task_id)
-
-
-# Prefix used by ``resolve_execution_task_id`` and older code.
-_EXECUTION_BACKEND_PREFIX = "execution-backend:"
-
-
-def _execution_backend_keys(backend_id: str) -> list[str]:
-    """Return all ``_task_env_overrides`` / ``_active_environments`` / other
-    tracking-map keys that match *backend_id*, handling both the old flat key
-    format ``execution-backend:<backend_id>`` and the new session-scoped format
-    ``execution-backend:<backend_id>:session:<hash>``.
-
-    Only the new format with the literal colon-separated segment ``session:``
-    followed by exactly 16 lowercase hex characters is accepted.  Arbitrary
-    colon suffixes (``execution-backend:<id>:foo``) are **not** matched.
-
-    Also scans ``_last_activity`` and ``_creation_locks`` so that keys only
-    present in those maps (e.g. after partial cleanup or mid-creation) are
-    found and cleaned up by ``clear_backend_execution_env``.
-    """
-    _NEW_FORMAT_SUFFIX = re.compile(r"^session:[0-9a-f]{16}$")
-
-    matched: list[str] = []
-    # Scan ALL tracking dicts so a key that only lives in one (e.g.
-    # ``_last_activity`` or ``_creation_locks``) is still found.
-    all_keys: set[str] = set()
-    with _task_env_overrides_lock:
-        all_keys.update(_task_env_overrides.keys())
-    with _env_lock:
-        all_keys.update(_active_environments.keys())
-        all_keys.update(_last_activity.keys())
-    with _session_cwd_lock:
-        all_keys.update(_session_cwd.keys())
-    with _creation_locks_lock:
-        all_keys.update(_creation_locks.keys())
-
-    for key in all_keys:
-        if not key.startswith(_EXECUTION_BACKEND_PREFIX):
-            continue
-        # Strip the prefix to get ``<backend-id>[:session:<hash>]``.
-        remainder = key[len(_EXECUTION_BACKEND_PREFIX):]
-        colon = remainder.find(":")
-        if colon == -1:
-            # Old format: ``<backend-id>`` — exact match only.
-            if remainder == backend_id:
-                matched.append(key)
-        else:
-            # New format: must have ``:session:<16-hex-hash>`` segment.
-            # First verify the backend-id prefix matches exactly.
-            if remainder[:colon] != backend_id:
-                continue
-            # Then validate the suffix is exactly ``:session:<16-hex>``.
-            suffix = remainder[colon + 1:]  # everything after ``<backend-id>:``
-            if _NEW_FORMAT_SUFFIX.fullmatch(suffix):
-                matched.append(key)
-
-    return matched
-
-
-def clear_backend_execution_env(backend_id: str) -> int:
-    """Clean up all in-memory state associated with *backend_id*.
-
-    Removes entries from ``_task_env_overrides``, ``_active_environments``,
-    ``_last_activity``, ``_creation_locks``, and ``_session_cwd`` for every
-    execution key (old format ``execution-backend:<id>`` and new format
-    ``execution-backend:<id>:session:<hash>``) that belongs to this backend.
-
-    Collects the environment references, removes them from the memory maps
-    FIRST (inside their respective locks), then stops/cleanups the actual
-    sandbox processes OUTSIDE the locks so concurrent tool calls are not
-    blocked by potentially slow Docker/Modal/SSH teardown.
-
-    ``file_ops`` cache for each matched key is also invalidated.
-
-    Returns the number of keys that were cleaned up.
-    """
-    matched_keys = _execution_backend_keys(backend_id)
-
-    # Phase 1: remove from memory maps (inside locks).  Must happen even
-    # if subsequent stop/cleanup throws.
-    envs_to_stop: list[tuple[str, Any]] = []
-    with _task_env_overrides_lock:
-        for key in matched_keys:
-            _task_env_overrides.pop(key, None)
-
-    with _env_lock:
-        for key in matched_keys:
-            env = _active_environments.pop(key, None)
-            _last_activity.pop(key, None)
-            if env is not None:
-                envs_to_stop.append((key, env))
-
-    with _creation_locks_lock:
-        for key in matched_keys:
-            _creation_locks.pop(key, None)
-
-    for key in matched_keys:
-        clear_session_cwd(key)
-
-    # Phase 2: invalidate file_ops cache (lock-free call).
-    try:
-        from tools.file_tools import clear_file_ops_cache
-
-        for key in matched_keys:
-            clear_file_ops_cache(key)
-    except Exception:
-        logger.exception("Failed to clear file_ops cache during backend env cleanup")
-
-    # Phase 3: stop/cleanup/terminate actual environments OUTSIDE locks.
-    for _key, env in envs_to_stop:
-        try:
-            if hasattr(env, "cleanup"):
-                env.cleanup()
-            elif hasattr(env, "stop"):
-                env.stop()
-            elif hasattr(env, "terminate"):
-                env.terminate()
-        except Exception:
-            logger.exception(
-                "Best-effort cleanup failed for env of backend %s",
-                backend_id,
-            )
-
-    return len(matched_keys)
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
@@ -1329,16 +1200,15 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    with _task_env_overrides_lock:
-        if task_id and task_id in _task_env_overrides:
-            overrides = _task_env_overrides[task_id]
-            if set(overrides.keys()) & _ISOLATION_KEYS:
-                return task_id
+    if task_id and task_id in _task_env_overrides:
+        overrides = _task_env_overrides[task_id]
+        if set(overrides.keys()) & _ISOLATION_KEYS:
+            return task_id
     return "default"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
-    """Return a copy of the env overrides for *task_id*, raw key first then collapsed.
+    """Return the env overrides for *task_id*, raw key first then collapsed.
 
     ``register_task_env_overrides`` writes under the *raw* task/session id, but
     a CWD-only override collapses (:func:`_resolve_container_task_id`) to the
@@ -1348,42 +1218,13 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     read the raw id FIRST and only fall back to the collapsed container id, or
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
-
-    Returns a *copy* of the overrides dict so callers cannot mutate the shared
-    internal registry.
     """
     raw = task_id or "default"
-    with _task_env_overrides_lock:
-        overrides = (
-            _task_env_overrides.get(raw)
-            or _task_env_overrides.get(_resolve_container_task_id(raw))
-            or {}
-        )
-        return dict(overrides)
-
-
-_TASK_ENV_CONFIG_KEYS = frozenset({
-    "env_type", "cwd",
-    "docker_image", "singularity_image", "modal_image", "daytona_image",
-    "ssh_host", "ssh_user", "ssh_port", "ssh_key", "ssh_persistent",
-    "ssh_sync_hermes_home",
-})
-
-
-def apply_task_env_overrides(
-    config: Dict[str, Any], overrides: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Return terminal config with safe per-task environment keys applied.
-
-    ``env_type`` was already an isolation signal, but environment creation used
-    to ignore it and keep reading the process-global backend. Session-selectable
-    backends require the override to select SSH without mutating TERMINAL_ENV.
-    """
-    effective = dict(config)
-    for key in _TASK_ENV_CONFIG_KEYS:
-        if key in overrides:
-            effective[key] = overrides[key]
-    return effective
+    return (
+        _task_env_overrides.get(raw)
+        or _task_env_overrides.get(_resolve_container_task_id(raw))
+        or {}
+    )
 
 
 # Configuration from environment variables
@@ -1783,7 +1624,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             key_path=ssh_config.get("key", ""),
             cwd=cwd,
             timeout=timeout,
-            sync_hermes_home=ssh_config.get("sync_hermes_home", True),
         )
 
     else:
@@ -2313,9 +2153,9 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Get configuration and apply the selected task/backend override without
-        # mutating process-global TERMINAL_ENV.
+        # Get configuration
         config = _get_env_config()
+        env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -2330,8 +2170,6 @@ def terminal_tool(
         # ``"default"``) is still found under its originating session id while
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
-        config = apply_task_env_overrides(config, overrides)
-        env_type = config["env_type"]
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -2448,7 +2286,6 @@ def terminal_tool(
                                 "port": config.get("ssh_port", 22),
                                 "key": config.get("ssh_key", ""),
                                 "persistent": config.get("ssh_persistent", False),
-                                "sync_hermes_home": config.get("ssh_sync_hermes_home", True),
                             }
 
                         container_config = None
