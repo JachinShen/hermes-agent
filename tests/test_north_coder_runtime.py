@@ -138,5 +138,5 @@ async def test_north_runtime_resolves_permission_and_answers_ask_user(tmp_path, 
     }
     assert seen[0] == ("permission", {"decision": "allow_once"})
     answer_payload = seen[1][1]
-    assert answer_payload["ask_user_response"]["tool_call_id"] == "ask-1"
-    assert answer_payload["ask_user_response"]["answers"][0]["type"] == "text"
+    assert answer_payload["metadata"]["ask_user_response"]["tool_call_id"] == "ask-1"
+    assert answer_payload["metadata"]["ask_user_response"]["answers"][0]["type"] == "text"

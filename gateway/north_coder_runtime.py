@@ -138,6 +138,20 @@ class NorthCoderRuntime:
                     terminal = await self._consume_events(ws, full_response, on_delta, on_event)
                 finally:
                     await ws.close()
+                # WebSocket run_finished is progress only; the REST invocation
+                # status is authoritative because a finished run may pause in
+                # requires_action.
+                if invocation_id:
+                    try:
+                        authoritative = await self._poll_result(client, invocation_id, full_response, on_event)
+                    except Exception as exc:
+                        logger.warning("North invocation status reconciliation unavailable: %s", exc)
+                    else:
+                        if authoritative.get("status"):
+                            terminal["status"] = authoritative["status"]
+                        if authoritative.get("required_action"):
+                            terminal["required_action"] = authoritative["required_action"]
+                        terminal["result"] = authoritative
             elif invocation_id:
                 terminal = await self._poll_result(client, invocation_id, full_response, on_event)
 
@@ -274,9 +288,11 @@ class NorthCoderRuntime:
                 lines.append(f"{index + 1}. {item['header']}: {item['value']}")
             payload = {
                 "content": "\n".join(lines),
-                "ask_user_response": {
-                    "tool_call_id": tool_call_id,
-                    "answers": normalized,
+                "metadata": {
+                    "ask_user_response": {
+                        "tool_call_id": tool_call_id,
+                        "answers": normalized,
+                    }
                 },
             }
             async with client.post(
@@ -302,8 +318,6 @@ class NorthCoderRuntime:
         """Submit a pending ask_user action and consume the resumed invocation."""
         import aiohttp
 
-        accepted = await self.answer_ask_user(invocation_id, answers)
-        resumed_id = str(accepted.get("invocation_id") or invocation_id)
         conversation_id = await self._conversation_id(session_key)
         full_response: list[str] = []
         terminal: dict[str, Any] = {"status": "completed", "tools": []}
@@ -313,6 +327,11 @@ class NorthCoderRuntime:
                 ws = await self._connect_events(client, conversation_id)
             except Exception:
                 ws = None
+            # Subscribe before posting the answer. answer_ask_user performs the
+            # authoritative status check and POST in a separate client, while
+            # this subscription closes the fast-run replay race.
+            accepted = await self.answer_ask_user(invocation_id, answers)
+            resumed_id = str(accepted.get("invocation_id") or invocation_id)
             if ws is not None:
                 try:
                     terminal = await self._consume_events(ws, full_response, on_delta, on_event)
@@ -399,6 +418,29 @@ class NorthCoderRuntime:
                 break
         return terminal
 
+    @staticmethod
+    def _extract_ask_user_questions(result: dict[str, Any]) -> list[dict[str, Any]]:
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return []
+        for block in reversed(blocks):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            payload = block
+            if not payload.get("name") and isinstance(payload.get("content"), str):
+                try:
+                    parsed = json.loads(payload["content"])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    payload = parsed
+            if payload.get("name") != "ask_user":
+                continue
+            input_payload = payload.get("input")
+            if isinstance(input_payload, dict) and isinstance(input_payload.get("questions"), list):
+                return [item for item in input_payload["questions"] if isinstance(item, dict)]
+        return []
+
     async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback]) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.timeout_seconds
         while time.monotonic() < deadline:
@@ -415,7 +457,13 @@ class NorthCoderRuntime:
             if text and not full_response:
                 full_response.append(str(text))
             status = str(result.get("status") or "")
-            if status in {"completed", "failed", "cancelled", "error"} or result.get("finished"):
+            required_action = result.get("required_action")
+            if isinstance(required_action, dict) and required_action.get("type") == "ask_user":
+                questions = self._extract_ask_user_questions(result)
+                if questions and not required_action.get("questions"):
+                    required_action = {**required_action, "questions": questions}
+                    result["required_action"] = required_action
+            if status in {"completed", "requires_action", "failed", "cancelled", "error"} or result.get("finished"):
                 if status not in {"completed", ""}:
                     return result
                 return result
