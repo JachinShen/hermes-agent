@@ -134,6 +134,10 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "name: complete_task" not in yaml_text
     assert "name: skill_manage" in yaml_text
     assert "binding: ./custom_tools/skill_manage_bridge.py:skill_manage" in yaml_text
+    assert "name: backend" in yaml_text
+    assert "name: terminal" in yaml_text
+    assert "name: run_shell_command" not in yaml_text
+    assert "name: background_task_manage" not in yaml_text
     assert (agent_yaml.parent / "tools" / "skill_manage.tool.yaml").is_file()
     bridge = (agent_yaml.parent / "custom_tools" / "skill_manage_bridge.py").read_text()
     assert str(home) in bridge
