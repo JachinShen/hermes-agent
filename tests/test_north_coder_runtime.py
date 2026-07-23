@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from aiohttp import web
 
-from gateway.north_coder_runtime import NorthCoderRuntime, NorthCoderRuntimeConfig
+from gateway.north_coder_runtime import NorthCoderRuntime, NorthCoderRuntimeConfig, NorthCoderTUIAgent
 from hermes_cli.north_coder_profile import export_hermes_profile
 
 
@@ -17,6 +18,25 @@ def test_north_runtime_syncs_save_memory_to_local_file(tmp_path, monkeypatch):
     ]
     NorthCoderRuntime._sync_local_memory(events)
     assert "North local memory probe" in (tmp_path / "hermes" / "memories" / "MEMORY.md").read_text()
+
+
+def test_north_tui_agent_forwards_tool_lifecycle_callbacks():
+    class FakeRuntime:
+        async def run_turn(self, **kwargs):
+            kwargs["on_event"]({"type": "tool_call_start", "toolCallId": "t-1", "toolCallName": "read_file"})
+            kwargs["on_event"]({"type": "tool_call_result", "toolCallId": "t-1", "content": "ok"})
+            return {"messages": [], "north_invocation_id": "inv-1"}
+
+    events = []
+    agent = NorthCoderTUIAgent(cast(Any, FakeRuntime()), "session-1")
+    agent.run_conversation(
+        "probe",
+        tool_start_callback=lambda *args: events.append(("start", args)),
+        tool_complete_callback=lambda *args: events.append(("complete", args)),
+    )
+    assert [kind for kind, _ in events] == ["start", "complete"]
+    assert events[0][1][0:2] == ("t-1", "read_file")
+    assert events[1][1][0:2] == ("t-1", "read_file")
 
 
 @pytest.mark.asyncio

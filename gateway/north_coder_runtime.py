@@ -613,16 +613,49 @@ class NorthCoderTUIAgent:
         self._last_invocation_id: Optional[str] = None
         self._interrupted = False
 
-    def run_conversation(self, message: Any, *, conversation_history=None, stream_callback=None, task_id=None, **kwargs):
+    def run_conversation(self, message: Any, *, conversation_history=None, stream_callback=None,
+                         tool_start_callback=None, tool_complete_callback=None,
+                         tool_progress_callback=None, task_id=None, **kwargs):
         text = message if isinstance(message, str) else str(message)
         if conversation_history:
             self.history = list(conversation_history)
+
+        tool_names: dict[str, Any] = {}
+
+        def on_event(event: dict[str, Any]) -> None:
+            if not (tool_start_callback or tool_complete_callback or tool_progress_callback):
+                return
+            kind = str(event.get("type") or "")
+            tool_name = event.get("toolCallName") or event.get("tool_name")
+            call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+            if not tool_name:
+                tool_name = tool_names.get(call_id)
+            if kind == "tool_call_start":
+                tool_names[call_id] = tool_name
+                if tool_start_callback:
+                    tool_start_callback(call_id, tool_name, event)
+                if tool_progress_callback:
+                    tool_progress_callback(
+                        "tool.started", name=tool_name, args=event,
+                    )
+            elif kind in {"tool_call_result", "tool_call_end"}:
+                call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                content = str(event.get("content") or "")
+                if tool_complete_callback:
+                    tool_complete_callback(call_id, tool_name, event, content)
+                if tool_progress_callback:
+                    tool_progress_callback(
+                        "tool.completed", name=tool_name,
+                        preview=content[:240], args=event,
+                    )
+
         result = asyncio.run(
             self.runtime.run_turn(
                 message=text,
                 session_key=self.session_key,
                 hermes_session_id=self.session_id,
                 on_delta=stream_callback,
+                on_event=on_event,
             )
         )
         self._last_invocation_id = result.get("north_invocation_id")

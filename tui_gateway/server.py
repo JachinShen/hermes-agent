@@ -9484,8 +9484,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 "stream_callback": _stream,
             }
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
+                _run_signature = inspect.signature(agent.run_conversation)
+                if "task_id" in _run_signature.parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                if "tool_progress_callback" in _run_signature.parameters:
+                    _callbacks = _agent_cbs(sid)
+                    run_kwargs["tool_start_callback"] = _callbacks["tool_start_callback"]
+                    run_kwargs["tool_complete_callback"] = _callbacks["tool_complete_callback"]
+                    run_kwargs["tool_progress_callback"] = _callbacks["tool_progress_callback"]
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
