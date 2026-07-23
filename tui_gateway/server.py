@@ -5018,6 +5018,31 @@ def _make_agent(
     )
 
 
+class _PostDeliveryCallback:
+    """Queue review notices until the foreground message is complete."""
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._released = False
+        self._pending: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
+            if not self._released:
+                self._pending.append(message)
+                return
+        self._callback(message)
+
+    def release(self) -> None:
+        with self._lock:
+            self._released = True
+            pending = list(self._pending)
+            self._pending.clear()
+        for message in pending:
+            self._callback(message)
+
+
 def _init_session(
     sid: str,
     key: str,
@@ -9390,6 +9415,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        review_delivery = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9411,6 +9437,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
+            review_callback = getattr(agent, "background_review_callback", None)
+            if callable(review_callback):
+                review_delivery = _PostDeliveryCallback(review_callback)
+                agent.background_review_callback = review_delivery
             _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
@@ -9647,6 +9677,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+            if review_delivery is not None:
+                review_delivery.release()
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

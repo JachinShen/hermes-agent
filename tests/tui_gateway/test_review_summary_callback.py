@@ -165,3 +165,23 @@ def test_load_memory_notifications_normalization(server, monkeypatch, raw, expec
     monkeypatch.setattr(server, "_load_cfg", lambda: {"display": display})
     assert server._load_memory_notifications() == expected
 
+
+def test_review_summary_waits_until_foreground_message_complete(server):
+    events = []
+    delivery = server._PostDeliveryCallback(
+        lambda message: events.append(("review.summary", message)),
+    )
+
+    delivery("memory updated")
+    assert events == []
+
+    events.append(("message.complete", "answer"))
+    delivery.release()
+    delivery("skill updated")
+
+    assert events == [
+        ("message.complete", "answer"),
+        ("review.summary", "memory updated"),
+        ("review.summary", "skill updated"),
+    ]
+

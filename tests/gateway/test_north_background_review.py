@@ -1062,3 +1062,137 @@ def test_tui_agent_returns_full_canonical_history(monkeypatch):
         {"role": "user", "content": "current question"},
         {"role": "assistant", "content": "current answer"},
     ]
+
+
+def test_gateway_hook_composes_canonical_history_and_wires_real_host(monkeypatch):
+    import gateway.north_coder_runtime as ncr
+    from gateway.run import _schedule_north_review_after_turn
+
+    captured = {}
+    host = object()
+    callback = object()
+
+    def fake_schedule(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ncr, "schedule_north_background_review", fake_schedule)
+    prior = [
+        {"role": "user", "content": "prior"},
+        {"role": "assistant", "content": "prior answer"},
+    ]
+    current = [
+        {"role": "user", "content": "current"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+    result = _north_result()
+    result["messages"] = current
+
+    _schedule_north_review_after_turn(
+        agent_history=prior,
+        result=result,
+        session_id="gateway-session",
+        session_key="gateway-key",
+        review_host=host,
+        background_review_callback=callback,
+        memory_notifications="verbose",
+    )
+
+    assert captured["canonical_history"] == prior + current
+    assert [m["content"] for m in captured["canonical_history"]].count("current") == 1
+    assert captured["review_host"] is host
+    assert captured["background_review_callback"] is callback
+    assert captured["memory_notifications"] == "verbose"
+    assert captured["session_id"] == "gateway-session"
+
+
+def test_scheduler_reaches_real_aia_agent_spawn_seam(monkeypatch):
+    import agent.background_review as background_review
+    import gateway.north_coder_runtime as ncr
+    import run_agent
+    from run_agent import AIAgent
+
+    ncr._NORTH_REVIEW_STATE.clear()
+    captured = {}
+
+    def fake_spawn(parent_agent, messages_snapshot, **kwargs):
+        captured["parent_agent"] = parent_agent
+        captured["messages_snapshot"] = messages_snapshot
+        captured.update(kwargs)
+        return (lambda: None), "review prompt"
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            captured["thread_kwargs"] = kwargs
+
+        def start(self):
+            captured["thread_started"] = True
+
+    class RealSeamHost:
+        _spawn_background_review = AIAgent._spawn_background_review
+        valid_tool_names = {"memory", "skill_manage"}
+        _memory_enabled = True
+        _user_profile_enabled = True
+        background_review_callback = None
+        memory_notifications = "on"
+
+    host = RealSeamHost()
+    monkeypatch.setattr(background_review, "spawn_background_review_thread", fake_spawn)
+    monkeypatch.setattr(run_agent.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "memory": {"nudge_interval": 1},
+            "skills": {"creation_nudge_interval": 0},
+        },
+    )
+
+    ncr.schedule_north_background_review(
+        canonical_history=_canonical_history(users=1),
+        north_result=_north_result(),
+        session_id="real-spawn-seam",
+        review_host=host,
+    )
+
+    assert captured["parent_agent"] is host
+    assert captured["review_memory"] is True
+    assert captured["review_skills"] is False
+    assert captured["thread_started"] is True
+    assert captured["thread_kwargs"]["daemon"] is True
+    assert captured["thread_kwargs"]["name"] == "bg-review"
+
+
+def test_same_session_counter_is_safe_under_concurrent_duplicate_scheduling(monkeypatch):
+    import threading
+
+    import gateway.north_coder_runtime as ncr
+
+    ncr._NORTH_REVIEW_STATE.clear()
+    stub, _, _ = _make_host_stub()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "memory": {"nudge_interval": 100},
+            "skills": {"creation_nudge_interval": 100},
+        },
+    )
+    barrier = threading.Barrier(8)
+
+    def schedule_once():
+        barrier.wait()
+        ncr.schedule_north_background_review(
+            canonical_history=_canonical_history(users=1),
+            north_result=_north_result(tools=[]),
+            session_id="concurrent-session",
+            review_host=stub,
+        )
+
+    threads = [threading.Thread(target=schedule_once) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    state = ncr._NORTH_REVIEW_STATE["concurrent-session"]
+    assert state["last_seen_user_count"] == 1
+    assert state["accum_user_turns"] == 1

@@ -1935,6 +1935,33 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _schedule_north_review_after_turn(
+    *,
+    agent_history: list[dict],
+    result: dict,
+    session_id: str | None,
+    session_key: str | None,
+    review_host,
+    background_review_callback,
+    memory_notifications: str,
+) -> None:
+    """Schedule Hermes review from a completed Gateway North turn."""
+    if not result.get("completed") or result.get("interrupted") or result.get("requires_action"):
+        return
+    from gateway.north_coder_runtime import schedule_north_background_review
+
+    canonical = list(agent_history)
+    canonical.extend(result.get("messages", []) or [])
+    schedule_north_background_review(
+        canonical_history=canonical,
+        north_result=result,
+        session_id=session_id or session_key or "gateway-anonymous",
+        review_host=review_host,
+        background_review_callback=background_review_callback,
+        memory_notifications=memory_notifications,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -19912,17 +19939,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.exception("Failed to register North pending action")
             result_holder[0] = result
             # Schedule background review after successful North foreground turn.
-            if _north_runtime is not None and result.get("completed") and not result.get("interrupted") and not result.get("requires_action"):
+            if _north_runtime is not None:
                 try:
-                    from gateway.north_coder_runtime import schedule_north_background_review as _schedule_north_bg
-                    _canonical = list(agent_history)
-                    _msgs = result.get("messages", [])
-                    if _msgs:
-                        _canonical.extend(_msgs)
-                    _schedule_north_bg(
-                        canonical_history=_canonical,
-                        north_result=result,
-                        session_id=session_id or session_key or "",
+                    _schedule_north_review_after_turn(
+                        agent_history=agent_history,
+                        result=result,
+                        session_id=session_id,
+                        session_key=session_key,
                         review_host=agent,
                         background_review_callback=_bg_review_send,
                         memory_notifications=getattr(agent, "memory_notifications", "on"),
