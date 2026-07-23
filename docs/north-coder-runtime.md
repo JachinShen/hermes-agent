@@ -94,7 +94,7 @@ plugins are not silently translated.
 | Tool progress/history | North tool events are forwarded to Gateway observers and retained in the result | aligned at protocol level |
 | Cancellation / `/stop` | Active invocation is tracked and cancelled through North REST; TUI cancellation is cross-thread safe | aligned on primary path |
 | Permission approval | North `requires_action` / permission events are surfaced as a paused result; pending permission actions are registered under the Hermes session key and `/approve`/`/deny` resolve the North invocation | primary permission route aligned |
-| `ask_user` | Gateway uses North's `/messages` answer contract, reconciles WebSocket progress with REST `requires_action`, extracts questions from the persisted result, and subscribes before resume POST | bridge aligned; installed North `0.3.3` has a backend regression clearing successful ask_user waits before persistence |
+| `ask_user` | Disabled in the exported Hermes North profile while the upstream North action-persistence issue is unresolved; Gateway resume support remains in code for profiles that explicitly enable it | intentionally disabled in default profile; tracked in north-coder#981 |
 | Queued follow-up / busy input | North owns conversation queue; Hermes busy-input policy is not yet mapped one-for-one | partial |
 | Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` remains North-owned | partial; no Hermes file sync |
 | Plugins / hooks | Hermes Gateway hooks still run around the turn; plugin-specific agent callbacks are not translated | partial |

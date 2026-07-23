@@ -99,6 +99,7 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     assert "sk-" not in yaml_text
     for tool_name in ("apply_patch", "save_memory", "complete_task"):
         assert f"name: {tool_name}" in yaml_text
+    assert "name: ask_user" not in yaml_text
 
 
 @pytest.mark.asyncio
