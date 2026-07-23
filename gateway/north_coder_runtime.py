@@ -182,7 +182,6 @@ class NorthCoderRuntime:
                 terminal["status"] = status
                 terminal["error"] = "North emitted an ask_user wait result without a resumable requires_action invocation"
         requires_action = status == "requires_action"
-        self._sync_local_memory(terminal.get("tools", []))
         # error after a terminal tool (notably complete_task) already returned
         # visible content. Hermes treats that tool result as the turn result;
         # preserve it instead of converting a successful turn into silence.
@@ -420,62 +419,6 @@ class NorthCoderRuntime:
         return terminal
 
     @staticmethod
-    def _sync_local_memory(tool_events: list[dict[str, Any]]) -> None:
-        """Apply North ``save_memory`` calls to Hermes' local memory files.
-
-        North emits tool arguments as one or more ``tool_call_args`` deltas.
-        The local Hermes memory implementation remains the source of truth for
-        file format, limits, locking, sanitization, and atomic persistence.
-        """
-        calls: dict[str, dict[str, Any]] = {}
-        for event in tool_events or []:
-            if not isinstance(event, dict):
-                continue
-            call_id = str(event.get("toolCallId") or "save_memory")
-            if event.get("type") == "tool_call_start":
-                if event.get("toolCallName") == "save_memory":
-                    calls.setdefault(call_id, {"chunks": []})
-                continue
-            call = calls.get(call_id)
-            if call is None:
-                continue
-            if event.get("type") == "tool_call_args":
-                delta = event.get("delta")
-                if isinstance(delta, str):
-                    call["chunks"].append(delta)
-                elif isinstance(delta, dict):
-                    call["args"] = delta
-            elif event.get("type") == "tool_call_result" and isinstance(event.get("args"), dict):
-                call["args"] = event["args"]
-        for call in calls.values():
-            args = call.get("args")
-            if not isinstance(args, dict):
-                raw = "".join(call.get("chunks", []))
-                try:
-                    args = json.loads(raw)
-                except (TypeError, json.JSONDecodeError):
-                    logger.warning("North save_memory args were not valid JSON; local write skipped")
-                    continue
-            if not isinstance(args, dict):
-                continue
-            if "fact" in args and "action" not in args:
-                args = {"action": "add", "target": "memory", "content": str(args["fact"])}
-            try:
-                from tools.memory_tool import load_on_disk_store, memory_tool
-                store = load_on_disk_store()
-                result = memory_tool(
-                    action=str(args.get("action") or ""),
-                    target=str(args.get("target") or "memory"),
-                    content=cast(str, args.get("content")) if isinstance(args.get("content"), str) else "",
-                    old_text=cast(str, args.get("old_text")) if isinstance(args.get("old_text"), str) else "",
-                    operations=cast(Optional[list[dict[str, Any]]], args.get("operations")) if isinstance(args.get("operations"), list) else None,
-                    store=store,
-                )
-                logger.info("North save_memory synchronized to Hermes local files: %s", result[:300])
-            except Exception:
-                logger.exception("Failed to synchronize North save_memory to Hermes local files")
-
-    @staticmethod
     def _extract_ask_user_questions(result: dict[str, Any]) -> list[dict[str, Any]]:
         blocks = result.get("blocks")
         if not isinstance(blocks, list):
@@ -538,9 +481,27 @@ class NorthCoderRuntime:
             self._write_state(state)
             return conversation_id
 
+    def _refresh_managed_profile(self) -> None:
+        """Refresh the generated Hermes artifact at a new-conversation boundary.
+
+        Only the canonical profile path under this Hermes home is managed. An
+        arbitrary user-supplied North ``agent_yaml_path`` is never overwritten.
+        """
+        if not self.config.agent_yaml_path:
+            return
+        configured = Path(self.config.agent_yaml_path).expanduser().resolve()
+        managed = (self.hermes_home / "north-coder-profile" / "agent.yaml").resolve()
+        if configured != managed:
+            return
+        from hermes_cli.north_coder_profile import export_hermes_profile
+
+        profile_name = self.config.agent_profile_id.replace(":", "-") or "hermes-default"
+        export_hermes_profile(self.hermes_home, managed.parent, name=profile_name)
+
     async def _create_conversation(self, session_key: str) -> str:
         import aiohttp
 
+        self._refresh_managed_profile()
         agent_config = {"agent_profile_id": self.config.agent_profile_id}
         if self.config.model_id:
             agent_config["model_id"] = self.config.model_id

@@ -24,20 +24,22 @@ to the North REST control plane, and consumes the North WebSocket event stream.
 ## Profile migration
 
 `hermes_cli.north_coder_profile.export_hermes_profile()` exports only the
-current Hermes profile's prompt context (`SOUL.md`, `memories/MEMORY.md`, and
-`memories/USER.md`), agent limits, core North builtin tools, and skill paths.
+current Hermes profile's prompt context (`SOUL.md` plus sanitized, frozen
+`MEMORY.md` / `USER.md` snapshots), agent limits, core North builtin tools,
+and active skill paths. Archived, dependency, cache, and skill support-package
+paths are excluded through Hermes' shared skill-discovery rule.
 It intentionally does not copy `.env`, auth, sessions, logs, caches, or
 provider credentials.
 
-Memory compatibility now uses the NexAU session/task builtin surface:
-`save_memory` and `complete_task` are exported in the artifact. `ToolSearch` is
-conditional in NexAU and is deliberately **not** declared in `tools:`; NexAU
-mounts it when required. The initial `MEMORY.md` and `USER.md` are also
-included in `system_prompt.md`.
-
-This is runtime capability parity, but not yet storage parity with Hermes'
-local memory database/files: writes made by North are owned by North's session
-backend and are not automatically synchronized back to Hermes `~/.hermes/memories`.
+Memory compatibility uses a Python custom tool named `memory` generated from
+Hermes' canonical schema. It delegates add/replace/remove/batch operations for
+both `target=memory` and `target=user` to Hermes `MemoryStore`, preserving its
+limits, locking, threat scanning, and atomic persistence. The generated prompt
+respects the independent `memory_enabled` / `user_profile_enabled` switches and
+their character budgets. A managed profile is refreshed immediately before a
+new North conversation is created; an existing conversation keeps its frozen
+snapshot. `complete_task` remains disabled, and conditional `ToolSearch` is not
+declared explicitly because NexAU mounts it when required.
 
 The Hermes default profile is exported locally to:
 
@@ -96,7 +98,7 @@ plugins are not silently translated.
 | Permission approval | North `requires_action` / permission events are surfaced as a paused result; pending permission actions are registered under the Hermes session key and `/approve`/`/deny` resolve the North invocation | primary permission route aligned |
 | `ask_user` / `complete_task` | Disabled in the exported Hermes North profile while the upstream North action-persistence and terminal-tool issues are unresolved; Gateway protocol support remains in code for profiles that explicitly enable them | intentionally disabled in default profile; ask_user tracked in north-coder#981 |
 | Queued follow-up / busy input | North owns conversation queue; Hermes busy-input policy is not yet mapped one-for-one | partial |
-| Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` tool calls are normalized and written through Hermes `MemoryStore` to local `MEMORY.md`/`USER.md`; snapshot refreshes next session | local write-back aligned; mid-session snapshot intentionally frozen |
+| Hermes memory read/search/write/update/delete | A sanitized Hermes `MemoryStore` snapshot is injected with independent MEMORY/USER switches and budgets; North calls the canonical `memory` custom tool for both targets; each new North conversation refreshes the managed profile while existing conversations remain frozen | aligned; real write → fresh-conversation read verified for both targets |
 | Hermes `/learn` / skill self-learning | North profile now mounts a real `skill_manage` Python custom tool backed by Hermes' `tools.skill_manager_tool`; it writes the active Hermes profile's `skills/` directory. `LoadSkill` discovers new skills after the next conversation/bootstrap; `~/.skills/hermes` is a compat link to the active skills directory | native create → new-session LoadSkill verified |
 | Images / attachments | Source metadata and workdir are passed; provider-specific binary attachment parity remains North-dependent | partial |
 | Session reset / branch / compress | North conversation lifecycle is authoritative; Hermes slash semantics do not automatically map to every North control-plane verb | partial |
