@@ -26,7 +26,6 @@ _CORE_NORTH_TOOLS = (
     ("web_search", "web.search"),
     ("web_read", "web.read"),
     ("write_todos", "session.write_todos"),
-    ("complete_task", "session.complete_task"),
     ("save_memory", "session.save_memory"),
 )
 
