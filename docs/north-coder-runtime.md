@@ -96,8 +96,8 @@ plugins are not silently translated.
 | Permission approval | North `requires_action` / permission events are surfaced as a paused result; pending permission actions are registered under the Hermes session key and `/approve`/`/deny` resolve the North invocation | primary permission route aligned |
 | `ask_user` / `complete_task` | Disabled in the exported Hermes North profile while the upstream North action-persistence and terminal-tool issues are unresolved; Gateway protocol support remains in code for profiles that explicitly enable them | intentionally disabled in default profile; ask_user tracked in north-coder#981 |
 | Queued follow-up / busy input | North owns conversation queue; Hermes busy-input policy is not yet mapped one-for-one | partial |
-| Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` remains North-owned | partial; no Hermes file sync |
-| Plugins / hooks | Hermes Gateway hooks still run around the turn; plugin-specific agent callbacks are not translated | partial |
+| Hermes memory read/search/write/update/delete | Startup snapshot is injected; North `save_memory` tool calls are normalized and written through Hermes `MemoryStore` to local `MEMORY.md`/`USER.md`; snapshot refreshes next session | local write-back aligned; mid-session snapshot intentionally frozen |
+| Hermes `/learn` / skill self-learning | North has dynamic `LoadSkill` but no `skill_manage`; Gateway `/learn` prompt falls back to `write_file` under `~/.hermes/skills/<category>/<name>/SKILL.md`; a new North conversation can load the created skill | real create → new-session LoadSkill verified |
 | Images / attachments | Source metadata and workdir are passed; provider-specific binary attachment parity remains North-dependent | partial |
 | Session reset / branch / compress | North conversation lifecycle is authoritative; Hermes slash semantics do not automatically map to every North control-plane verb | partial |
 | Native fallback | `/runtime native` remains available for TUI session-local switching | aligned |

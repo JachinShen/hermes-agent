@@ -8,6 +8,17 @@ from gateway.north_coder_runtime import NorthCoderRuntime, NorthCoderRuntimeConf
 from hermes_cli.north_coder_profile import export_hermes_profile
 
 
+def test_north_runtime_syncs_save_memory_to_local_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    events = [
+        {"type": "tool_call_start", "toolCallId": "mem-1", "toolCallName": "save_memory"},
+        {"type": "tool_call_args", "toolCallId": "mem-1", "delta": '{"action":"add","target":"memory","content":"North local memory probe"}'},
+        {"type": "tool_call_result", "toolCallId": "mem-1", "content": "saved"},
+    ]
+    NorthCoderRuntime._sync_local_memory(events)
+    assert "North local memory probe" in (tmp_path / "hermes" / "memories" / "MEMORY.md").read_text()
+
+
 @pytest.mark.asyncio
 async def test_north_runtime_translates_conversation_message_and_events(tmp_path, aiohttp_server):
     conversation_id = "conv-test"
