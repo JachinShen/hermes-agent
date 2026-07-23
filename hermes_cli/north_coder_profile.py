@@ -11,6 +11,83 @@ from pathlib import Path
 from typing import Any
 
 
+def _skill_manage_tool_yaml() -> str:
+    return """type: tool
+name: skill_manage
+description: >-
+  Manage Hermes procedural-memory skills. Use create, patch, edit, delete,
+  write_file, or remove_file. New skills are stored in the active Hermes
+  profile's skills directory.
+input_schema:
+  type: object
+  properties:
+    action:
+      type: string
+      enum: [create, patch, edit, delete, write_file, remove_file]
+    name:
+      type: string
+    content:
+      type: string
+    category:
+      type: string
+    file_path:
+      type: string
+    file_content:
+      type: string
+    old_string:
+      type: string
+    new_string:
+      type: string
+    replace_all:
+      type: boolean
+    absorbed_into:
+      type: string
+  required: [action, name]
+  additionalProperties: false
+"""
+
+
+def _skill_manage_bridge_py(hermes_home: Path) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    venv_python = hermes_home / "hermes-agent" / "venv" / "bin" / "python"
+    helper = r'''import json, os, subprocess
+
+
+def skill_manage(action, name, content=None, category=None, file_path=None,
+                 file_content=None, old_string=None, new_string=None,
+                 replace_all=False, absorbed_into=None, **_ignored):
+    payload = {
+        "action": action, "name": name, "content": content,
+        "category": category, "file_path": file_path,
+        "file_content": file_content, "old_string": old_string,
+        "new_string": new_string, "replace_all": replace_all,
+        "absorbed_into": absorbed_into,
+    }
+    payload = {key: value for key, value in payload.items() if value is not None}
+    env = os.environ.copy()
+    env["HERMES_HOME"] = __HERMES_HOME__
+    env["PYTHONPATH"] = __REPO_ROOT__ + os.pathsep + env.get("PYTHONPATH", "")
+    code = """
+import json, sys
+from tools.skill_manager_tool import skill_manage
+args = json.load(sys.stdin)
+print(skill_manage(**args))
+"""
+    proc = subprocess.run(
+        [__VENV_PYTHON__, "-c", code], input=json.dumps(payload), text=True,
+        capture_output=True, env=env,
+    )
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or "Hermes skill_manage helper failed")
+    return proc.stdout.strip()
+'''
+    return (
+        helper.replace("__HERMES_HOME__", repr(str(hermes_home)))
+        .replace("__REPO_ROOT__", repr(str(repo_root)))
+        .replace("__VENV_PYTHON__", repr(str(venv_python)))
+    )
+
+
 _CORE_NORTH_TOOLS = (
     ("read_file", "file.read_file"),
     ("write_file", "file.write_file"),
@@ -53,6 +130,14 @@ def export_hermes_profile(
         if path.is_file():
             prompt_parts.extend(["", f"## {title}", "", path.read_text(encoding="utf-8")])
     (output_dir / "system_prompt.md").write_text("\n".join(prompt_parts).rstrip() + "\n", encoding="utf-8")
+    custom_tools_dir = output_dir / "custom_tools"
+    tool_specs_dir = output_dir / "tools"
+    custom_tools_dir.mkdir(parents=True, exist_ok=True)
+    tool_specs_dir.mkdir(parents=True, exist_ok=True)
+    (tool_specs_dir / "skill_manage.tool.yaml").write_text(_skill_manage_tool_yaml(), encoding="utf-8")
+    (custom_tools_dir / "skill_manage_bridge.py").write_text(
+        _skill_manage_bridge_py(hermes_home), encoding="utf-8"
+    )
 
     skill_paths = sorted(
         str(path.parent)
@@ -80,6 +165,11 @@ def export_hermes_profile(
     ]
     for tool_name, builtin in _CORE_NORTH_TOOLS:
         lines.extend([f"  - name: {tool_name}", f"    builtin: {builtin}"])
+    lines.extend([
+        "  - name: skill_manage",
+        "    yaml_path: ./tools/skill_manage.tool.yaml",
+        "    binding: ./custom_tools/skill_manage_bridge.py:skill_manage",
+    ])
     if skill_paths:
         lines.extend(["", "skills:"])
         lines.extend(f"  - {path}" for path in skill_paths)

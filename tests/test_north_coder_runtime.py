@@ -112,6 +112,11 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
         assert f"name: {tool_name}" in yaml_text
     assert "name: ask_user" not in yaml_text
     assert "name: complete_task" not in yaml_text
+    assert "name: skill_manage" in yaml_text
+    assert "binding: ./custom_tools/skill_manage_bridge.py:skill_manage" in yaml_text
+    assert (agent_yaml.parent / "tools" / "skill_manage.tool.yaml").is_file()
+    bridge = (agent_yaml.parent / "custom_tools" / "skill_manage_bridge.py").read_text()
+    assert str(home) in bridge
 
 
 @pytest.mark.asyncio
