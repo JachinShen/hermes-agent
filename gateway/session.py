@@ -641,7 +641,7 @@ def build_session_context_prompt(
 # provider resolution) is intentionally excluded: credentials must NEVER be
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url", "agent_runtime")
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -658,6 +658,11 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    runtime = cleaned.get("agent_runtime", "").strip().lower()
+    if runtime in {"native", "ncoder"}:
+        cleaned["agent_runtime"] = runtime
+    else:
+        cleaned.pop("agent_runtime", None)
     return cleaned or None
 
 

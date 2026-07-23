@@ -1738,6 +1738,7 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.4",
         provider="openai-codex",
+        runtime_override="ncoder",
         base_url="https://custom.example/v1",
         api_mode="chat_completions",
         reasoning_config={"enabled": True, "effort": "high"},
@@ -1758,9 +1759,15 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
             "api_mode": "chat_completions",
             "reasoning_config": {"enabled": True, "effort": "high"},
             "service_tier": "priority",
+            "agent_runtime": "ncoder",
         },
         "gpt-5.4",
     )
+
+    restored = server._stored_session_runtime_overrides(
+        {"model": "gpt-5.4", "model_config": updates["meta"][1]}
+    )
+    assert restored["runtime_override"] == "ncoder"
 
 
 def test_status_callback_emits_kind_and_text():

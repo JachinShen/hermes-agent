@@ -2097,6 +2097,42 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_runtime_command(self, event: MessageEvent) -> str:
+        """Show or change the runtime binding for exactly one Gateway session."""
+        from gateway.north_coder_runtime import runtime_from_raw
+        from gateway.run import _gateway_config_home, _load_gateway_config
+
+        target = (event.get_command_args() or "").strip().lower()
+        if target and target not in {"native", "ncoder"}:
+            return "Usage: /runtime [native|ncoder]"
+
+        session_key = self._session_key_for_source(event.source)
+        self._rehydrate_session_model_override(session_key)
+        existing = dict(self._session_model_overrides.get(session_key) or {})
+        north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+        current = str(existing.get("agent_runtime") or ("ncoder" if north_runtime else "native"))
+        if not target:
+            return f"Agent runtime for this session: {current}"
+        if target == "ncoder" and north_runtime is None:
+            return "North Coder runtime is not configured."
+        if target == current:
+            return f"Agent runtime already: {target}"
+
+        existing["agent_runtime"] = target
+        self._session_model_overrides[session_key] = existing
+        try:
+            await self.async_session_store.set_model_override(session_key, existing)
+        except Exception:
+            logger.debug("Failed to persist session runtime override", exc_info=True)
+
+        # A provider conversation is disposable execution state. Detach it on
+        # either direction so returning to North seeds the canonical Gateway
+        # transcript rather than reviving a stale private history.
+        if north_runtime is not None:
+            north_runtime.detach_session(session_key)
+        self._evict_cached_agent(session_key)
+        return f"Switched agent runtime for this session: {target}"
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 

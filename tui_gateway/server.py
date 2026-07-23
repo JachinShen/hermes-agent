@@ -2520,6 +2520,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
+    agent_runtime = str(model_config.get("agent_runtime") or "").strip().lower()
 
     # Heal a bare ``"custom"`` provider stored by an older build (or any leak
     # site that bypassed _runtime_model_config's normalization). Bare custom is
@@ -2561,6 +2562,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:
         overrides["service_tier_override"] = service_tier
+    if agent_runtime in {"native", "ncoder"}:
+        overrides["runtime_override"] = agent_runtime
 
     return overrides
 
@@ -2573,6 +2576,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
+    agent_runtime = str(getattr(agent, "runtime_override", "") or "").strip().lower()
 
     if model:
         config["model"] = model
@@ -2619,6 +2623,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    if agent_runtime in {"native", "ncoder"}:
+        config["agent_runtime"] = agent_runtime
+    else:
+        config.pop("agent_runtime", None)
 
     return config
 
@@ -13805,10 +13813,15 @@ def _switch_session_runtime(sid: str, session: dict, target: str) -> str:
             )
         finally:
             _clear_session_context(tokens)
+        provider_runtime = getattr(current, "runtime", None) or getattr(new_agent, "runtime", None)
+        if provider_runtime is not None and hasattr(provider_runtime, "detach_session"):
+            provider_runtime.detach_session(session["session_key"])
+        setattr(new_agent, "runtime_override", target)
         if current is not None and hasattr(current, "close"):
             current.close()
         session["runtime_override"] = target
         session["agent"] = new_agent
+        _persist_live_session_runtime(session)
         _restart_slash_worker(sid, session)
         _wire_callbacks(sid)
         _emit("session.info", sid, _session_info(new_agent, session))

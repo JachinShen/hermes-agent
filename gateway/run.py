@@ -9873,9 +9873,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
-            # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+            # Runtime/model switches must not race the active turn.
+            if _cmd_def_inner and _cmd_def_inner.name in {"model", "runtime"}:
+                noun = "runtime" if _cmd_def_inner.name == "runtime" else "models"
+                return f"Agent is running — wait or /stop first, then switch {noun}."
 
             # /codex-runtime must not be used while the agent is running.
             # Switching mid-turn would split a turn across two transports.
@@ -10311,6 +10312,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical == "runtime":
+            return await self._handle_runtime_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
@@ -16681,6 +16685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
+            "agent_runtime": persisted.get("agent_runtime"),
         }
         provider = persisted.get("provider")
         if provider:
@@ -19814,11 +19819,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 _north_runtime = None
+                _runtime_choice = str(
+                    (self._session_model_overrides.get(session_key or "") or {}).get("agent_runtime") or ""
+                ).strip().lower()
                 try:
                     from gateway.north_coder_runtime import runtime_from_raw
-                    _north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+                    if _runtime_choice != "native":
+                        _north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
                 except Exception:
                     logger.exception("Failed to initialize North Coder runtime adapter")
+                if _runtime_choice == "ncoder" and _north_runtime is None:
+                    raise RuntimeError("This session is bound to ncoder, but North Coder runtime is not configured")
                 if _north_runtime is not None:
                     def _north_event_sync(_event: dict[str, Any]) -> None:
                         _kind = str(_event.get("type") or "")
@@ -19835,12 +19846,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 preview=str(_event.get("content") or "")[:240],
                                 args=_event,
                             )
+                    from agent.runtime_cwd import resolve_agent_cwd
+
                     result = asyncio.run(_north_runtime.run_turn(
                         message=_api_run_message if isinstance(_api_run_message, str) else message,
                         session_key=session_key or session_id,
                         hermes_session_id=session_id,
                         context_prompt=combined_ephemeral,
                         source=source,
+                        conversation_history=agent_history,
+                        workdir=str(resolve_agent_cwd()),
                         event_message_id=event_message_id,
                         on_delta=_stream_delta_cb,
                         on_event=_north_event_sync,

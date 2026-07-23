@@ -1,5 +1,7 @@
+import asyncio
 import importlib.util
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -61,7 +63,10 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
 
     async def send_message(request):
         payload = await request.json()
-        assert payload["content"] == "hello"
+        assert "gateway-history-question" in payload["content"]
+        assert "gateway-history-answer" in payload["content"]
+        assert payload["content"].endswith("hello")
+
         assert payload["agent_profile_id"] == "builtin:general"
         assert payload["model_id"] == "ng-test-model"
         assert payload["metadata"]["hermes_context_prompt"] == "channel context"
@@ -105,6 +110,10 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
         message="hello",
         session_key="slack:C:thread",
         hermes_session_id="hermes-session",
+        conversation_history=[
+            {"role": "user", "content": "gateway-history-question"},
+            {"role": "assistant", "content": "gateway-history-answer"},
+        ],
         context_prompt="channel context",
         metadata_extra={"ask_user_response": {"tool_call_id": "ask-1"}},
     )
@@ -115,6 +124,179 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
     assert result["north_conversation_id"] == conversation_id
     assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
         "slack:C:thread": conversation_id
+    }
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohttp_server):
+    seen: list[dict[str, Any]] = []
+
+    async def composite_run(request):
+        seen.append(await request.json())
+        suffix = len(seen)
+        return web.json_response(
+            {
+                "conversation_id": f"conv-workdir-{suffix}",
+                "invocation_id": f"inv-workdir-{suffix}",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    async def invocation_result(_request):
+        return web.json_response(
+            {
+                "status": "completed",
+                "blocks": [
+                    {
+                        "role": "assistant",
+                        "block_type": "text",
+                        "content": "cwd ok",
+                    }
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(
+            base_url=f"http://{server.host}:{server.port}",
+            agent_profile_id="hermes:default",
+            agent_yaml_path="/tmp/hermes-agent.yaml",
+            model_id="ng-test-model",
+        ),
+        tmp_path,
+    )
+
+    result = await runtime.run_turn(
+        message="inspect cwd",
+        session_key="session-workdir",
+        hermes_session_id="h-workdir",
+        conversation_history=[{"role": "user", "content": "gateway cwd history"}],
+        workdir=str(tmp_path),
+    )
+
+    assert seen[0]["workdir"] == str(tmp_path)
+    assert seen[0]["agent_yaml_path"] == "/tmp/hermes-agent.yaml"
+    assert seen[0]["model_id"] == "ng-test-model"
+    assert "gateway cwd history" in seen[0]["content"]
+    assert seen[0]["content"].endswith("inspect cwd")
+    assert result["north_conversation_id"] == "conv-workdir-1"
+    assert result["final_response"] == "cwd ok"
+
+    changed_workdir = tmp_path / "changed"
+    changed_workdir.mkdir()
+    changed = await runtime.run_turn(
+        message="inspect changed cwd",
+        session_key="session-workdir",
+        hermes_session_id="h-workdir",
+        conversation_history=result["messages"],
+        workdir=str(changed_workdir),
+    )
+
+    assert len(seen) == 2
+    assert seen[1]["workdir"] == str(changed_workdir)
+    assert "inspect cwd" in seen[1]["content"]
+    assert changed["north_conversation_id"] == "conv-workdir-2"
+    assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
+        "session-workdir": {
+            "conversation_id": "conv-workdir-2",
+            "workdir": str(changed_workdir),
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_seeds_history_only_for_new_conversation(tmp_path, aiohttp_server):
+    sent: list[dict[str, Any]] = []
+
+    async def create_conversation(_request):
+        return web.json_response({"id": "conv-history"})
+
+    async def send_message(request):
+        sent.append(await request.json())
+        ws = request.app["ws"]
+        await ws.send_json({"type": "replay_end"})
+        await ws.send_json({"type": "run_started", "messageId": f"m-{len(sent)}"})
+        await ws.send_json({"type": "text_message_content", "messageId": f"m-{len(sent)}", "delta": "ok"})
+        await ws.send_json({"type": "run_finished", "messageId": f"m-{len(sent)}"})
+        return web.json_response({"invocation_id": f"inv-{len(sent)}", "status": "running"})
+
+    async def websocket(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        request.app["ws"] = ws
+        await ws.receive()
+        return ws
+
+    app = web.Application()
+    app["ws"] = None
+    app.router.add_post("/api/workspaces/home-default/conversations", create_conversation)
+    app.router.add_post("/api/conversations/conv-history/messages", send_message)
+    app.router.add_get("/ws/conversation/conv-history", websocket)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    history = [{"role": "user", "content": "canonical gateway marker"}]
+    await runtime.run_turn(message="first", session_key="session-a", hermes_session_id="h-a", conversation_history=history)
+    await runtime.run_turn(message="second", session_key="session-a", hermes_session_id="h-a", conversation_history=history)
+
+    assert "canonical gateway marker" in sent[0]["content"]
+    assert sent[0]["content"].endswith("first")
+    assert sent[1]["content"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_keeps_conversations_independent_per_session(tmp_path, aiohttp_server):
+    created = 0
+
+    async def create_conversation(_request):
+        nonlocal created
+        created += 1
+        return web.json_response({"id": f"conv-{created}"})
+
+    app = web.Application()
+    app.router.add_post("/api/workspaces/home-default/conversations", create_conversation)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    assert await runtime._conversation_id("session-a") == "conv-1"
+    assert await runtime._conversation_id("session-b") == "conv-2"
+    assert await runtime._conversation_id("session-a") == "conv-1"
+
+
+def test_north_runtime_state_is_safe_across_gateway_worker_event_loops(tmp_path, monkeypatch):
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url="http://north.invalid"),
+        tmp_path,
+    )
+
+    async def create(session_key: str) -> str:
+        await asyncio.sleep(0.01)
+        return f"conv-{session_key}"
+
+    monkeypatch.setattr(runtime, "_create_conversation", create)
+
+    def resolve(session_key: str) -> str:
+        return asyncio.run(runtime._conversation_id(session_key))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(resolve, "session-a")
+        second = pool.submit(resolve, "session-b")
+
+    assert {first.result(), second.result()} == {"conv-session-a", "conv-session-b"}
+    assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
+        "session-a": "conv-session-a",
+        "session-b": "conv-session-b",
     }
 
 
