@@ -19873,8 +19873,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 preview=str(_event.get("content") or "")[:240],
                                 args=_event,
                             )
-                    from agent.runtime_cwd import resolve_agent_cwd
-
                     result = asyncio.run(_north_runtime.run_turn(
                         message=_api_run_message if isinstance(_api_run_message, str) else message,
                         session_key=session_key or session_id,
@@ -19882,7 +19880,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         context_prompt=combined_ephemeral,
                         source=source,
                         conversation_history=agent_history,
-                        workdir=str(resolve_agent_cwd()),
+                        # Messaging Gateway has no user-selected project cwd by
+                        # default. Never leak launchd's infrastructure cwd
+                        # (~/.hermes) into North's project registry; bind the
+                        # conversation to North's configured default workspace.
+                        workdir=None,
+                        workspace_id=_north_runtime.config.workspace_id,
                         event_message_id=event_message_id,
                         on_delta=_stream_delta_cb,
                         on_event=_north_event_sync,

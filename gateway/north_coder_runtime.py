@@ -79,6 +79,7 @@ class NorthCoderRuntime:
         source: Any = None,
         conversation_history: Optional[list[dict[str, Any]]] = None,
         workdir: Optional[str] = None,
+        workspace_id: Optional[str] = None,
         event_message_id: Optional[str] = None,
         on_delta: Optional[DeltaCallback] = None,
         on_event: Optional[EventCallback] = None,
@@ -86,18 +87,34 @@ class NorthCoderRuntime:
     ) -> dict[str, Any]:
         import aiohttp
 
-        effective_workdir = workdir or getattr(source, "workdir", None)
+        requested_workspace_id = str(workspace_id or "").strip() or None
+        # A caller-selected North workspace and an arbitrary filesystem workdir
+        # are mutually exclusive routing modes. Gateway defaults select the
+        # former; TUI/project sessions select the latter.
+        effective_workdir = None if requested_workspace_id else (
+            workdir or getattr(source, "workdir", None)
+        )
         if effective_workdir:
             effective_workdir = str(Path(effective_workdir).expanduser().resolve())
         existing_id, existing_workdir, existing_workspace_id = await self._conversation_binding(
             session_key
         )
         composite_run = bool(
-            effective_workdir
-            and (
-                not existing_id
-                or existing_workdir != effective_workdir
-                or not existing_workspace_id
+            (
+                requested_workspace_id
+                and (
+                    not existing_id
+                    or existing_workspace_id != requested_workspace_id
+                    or bool(existing_workdir)
+                )
+            )
+            or (
+                effective_workdir
+                and (
+                    not existing_id
+                    or existing_workdir != effective_workdir
+                    or not existing_workspace_id
+                )
             )
         )
         if composite_run:
@@ -139,13 +156,8 @@ class NorthCoderRuntime:
             ws = None
             if composite_run:
                 self._refresh_managed_profile()
-                run_payload = {
+                run_payload: dict[str, Any] = {
                     "content": payload["content"],
-                    "workdir": effective_workdir,
-                    # Hermes sessions must be navigable from the North sidebar.
-                    # A bare workdir creates a workspace-less conversation that
-                    # North Studio intentionally cannot open.
-                    "register_workdir": True,
                     "agent_profile_id": self.config.agent_profile_id,
                     "metadata": payload["metadata"],
                     "conversation_options": {
@@ -153,6 +165,14 @@ class NorthCoderRuntime:
                         "agent_config": {"agent_profile_id": self.config.agent_profile_id},
                     },
                 }
+                if effective_workdir:
+                    # Hermes project sessions must be navigable from the North
+                    # sidebar. A bare workdir creates a workspace-less
+                    # conversation that North Studio intentionally cannot open.
+                    run_payload["workdir"] = effective_workdir
+                    run_payload["register_workdir"] = True
+                elif requested_workspace_id:
+                    run_payload["workspace_id"] = requested_workspace_id
                 if self.config.model_id:
                     run_payload["model_id"] = self.config.model_id
                 if self.config.agent_yaml_path:
@@ -180,10 +200,15 @@ class NorthCoderRuntime:
                     workspace_id = str(accepted.get("workspace_id") or "")
                     if not workspace_id:
                         raise RuntimeError("North composite run response omitted workspace_id")
+                    if requested_workspace_id and workspace_id != requested_workspace_id:
+                        raise RuntimeError(
+                            "North composite run response returned unexpected workspace_id "
+                            f"{workspace_id!r}; expected {requested_workspace_id!r}"
+                        )
                     await self._record_conversation_binding(
                         session_key,
                         conversation_id,
-                        str(effective_workdir),
+                        str(effective_workdir) if effective_workdir else None,
                         workspace_id,
                     )
                 invocation_id = accepted.get("invocation_id")

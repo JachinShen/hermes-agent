@@ -128,6 +128,67 @@ async def test_north_runtime_translates_conversation_message_and_events(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_north_runtime_binds_gateway_default_to_home_workspace(tmp_path, aiohttp_server):
+    seen: list[dict[str, Any]] = []
+
+    async def composite_run(request):
+        seen.append(await request.json())
+        return web.json_response(
+            {
+                "conversation_id": "home-conversation",
+                "workspace_id": "home-default",
+                "invocation_id": "home-invocation",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    async def invocation_result(_request):
+        return web.json_response(
+            {
+                "status": "completed",
+                "blocks": [
+                    {"role": "assistant", "block_type": "text", "content": "home ok"}
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    result = await runtime.run_turn(
+        message="gateway default",
+        session_key="gateway-session",
+        hermes_session_id="hermes-session",
+        workspace_id="home-default",
+    )
+
+    assert len(seen) == 1
+    payload = seen[0]
+    assert payload["content"] == "gateway default"
+    assert payload["workspace_id"] == "home-default"
+    assert "workdir" not in payload
+    assert "register_workdir" not in payload
+    assert payload["metadata"]["hermes_session_key"] == "gateway-session"
+    assert payload["conversation_options"]["title"] == "Hermes gateway-session"
+    assert result["north_conversation_id"] == "home-conversation"
+    assert result["final_response"] == "home ok"
+    assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
+        "gateway-session": {
+            "conversation_id": "home-conversation",
+            "workdir": None,
+            "workspace_id": "home-default",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohttp_server):
     seen: list[dict[str, Any]] = []
 
