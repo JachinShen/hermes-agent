@@ -16940,6 +16940,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
+        # North foreground turns execute through a process-wide runtime adapter,
+        # while _running_agents still contains the Hermes host used by the
+        # Gateway lifecycle. Interrupt both boundaries: cancel_session is a
+        # no-op unless this exact session owns an active (or starting) North
+        # invocation, so native sessions retain their existing behavior.
+        try:
+            from gateway.north_coder_runtime import runtime_from_raw
+
+            north_runtime = runtime_from_raw(
+                _load_gateway_config(), _gateway_config_home()
+            )
+            if north_runtime is not None:
+                await north_runtime.cancel_session_async(session_key)
+        except Exception:
+            logger.exception(
+                "Failed to cancel North invocation for session %s", session_key
+            )
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(

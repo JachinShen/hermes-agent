@@ -67,9 +67,54 @@ class NorthCoderRuntime:
         self._state_lock = threading.RLock()
         # Process-local ownership for cross-thread Gateway/TUI interrupts.
         self._active_invocations: dict[str, str] = {}
+        self._inflight_sessions: set[str] = set()
+        self._cancel_requested_sessions: set[str] = set()
         self._active_lock = threading.RLock()
 
     async def run_turn(
+        self,
+        *,
+        message: str,
+        session_key: str,
+        hermes_session_id: str,
+        context_prompt: str = "",
+        source: Any = None,
+        conversation_history: Optional[list[dict[str, Any]]] = None,
+        workdir: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        event_message_id: Optional[str] = None,
+        on_delta: Optional[DeltaCallback] = None,
+        on_event: Optional[EventCallback] = None,
+        metadata_extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Run one North turn with exception-safe interrupt ownership."""
+        with self._active_lock:
+            self._inflight_sessions.add(session_key)
+            # A cancellation belongs to one concrete in-flight turn. Never let
+            # a stale request poison the next turn for the same Hermes session.
+            self._cancel_requested_sessions.discard(session_key)
+        try:
+            return await self._run_turn_impl(
+                message=message,
+                session_key=session_key,
+                hermes_session_id=hermes_session_id,
+                context_prompt=context_prompt,
+                source=source,
+                conversation_history=conversation_history,
+                workdir=workdir,
+                workspace_id=workspace_id,
+                event_message_id=event_message_id,
+                on_delta=on_delta,
+                on_event=on_event,
+                metadata_extra=metadata_extra,
+            )
+        finally:
+            with self._active_lock:
+                self._active_invocations.pop(session_key, None)
+                self._inflight_sessions.discard(session_key)
+                self._cancel_requested_sessions.discard(session_key)
+
+    async def _run_turn_impl(
         self,
         *,
         message: str,
@@ -215,6 +260,9 @@ class NorthCoderRuntime:
                 if invocation_id:
                     with self._active_lock:
                         self._active_invocations[session_key] = str(invocation_id)
+                        cancel_requested = session_key in self._cancel_requested_sessions
+                    if cancel_requested:
+                        await self.cancel(str(invocation_id))
 
             if composite_run:
                 try:
@@ -320,9 +368,23 @@ class NorthCoderRuntime:
         with self._active_lock:
             return self._active_invocations.get(session_key)
 
+    def _request_session_cancel(self, session_key: str) -> Optional[str]:
+        """Record a turn cancellation and return an accepted invocation id."""
+        with self._active_lock:
+            invocation_id = self._active_invocations.get(session_key)
+            if not invocation_id and session_key in self._inflight_sessions:
+                self._cancel_requested_sessions.add(session_key)
+            return invocation_id
+
+    async def cancel_session_async(self, session_key: str) -> None:
+        """Cancel a North turn from an async Gateway command handler."""
+        invocation_id = self._request_session_cancel(session_key)
+        if invocation_id:
+            await self.cancel(invocation_id)
+
     def cancel_session(self, session_key: str) -> None:
         """Best-effort synchronous cancellation hook for Gateway/TUI threads."""
-        invocation_id = self.active_invocation(session_key)
+        invocation_id = self._request_session_cancel(session_key)
         if not invocation_id:
             return
         try:

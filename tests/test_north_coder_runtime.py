@@ -370,6 +370,61 @@ async def test_north_runtime_rejects_composite_run_without_workspace_binding(tmp
 
 
 @pytest.mark.asyncio
+async def test_north_runtime_cancels_starting_invocation_after_id_arrives(tmp_path, aiohttp_server):
+    accepted = asyncio.Event()
+    release_response = asyncio.Event()
+    cancelled: list[str] = []
+
+    async def composite_run(_request):
+        accepted.set()
+        await release_response.wait()
+        return web.json_response(
+            {
+                "conversation_id": "conv-cancel-race",
+                "workspace_id": "home-default",
+                "invocation_id": "inv-cancel-race",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    async def cancel_invocation(request):
+        cancelled.append(request.match_info["invocation_id"])
+        return web.json_response({"status": "cancelled"})
+
+    async def invocation_result(_request):
+        return web.json_response({"status": "cancelled", "blocks": []})
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_post("/api/invocations/{invocation_id}/cancel", cancel_invocation)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    turn = asyncio.create_task(
+        runtime.run_turn(
+            message="long task",
+            session_key="gateway-cancel-race",
+            hermes_session_id="hermes-cancel-race",
+            workspace_id="home-default",
+        )
+    )
+    await accepted.wait()
+    runtime.cancel_session("gateway-cancel-race")
+    release_response.set()
+
+    result = await turn
+
+    assert cancelled == ["inv-cancel-race"]
+    assert result["interrupted"] is True
+    assert runtime.active_invocation("gateway-cancel-race") is None
+
+
+@pytest.mark.asyncio
 async def test_north_runtime_seeds_history_only_for_new_conversation(tmp_path, aiohttp_server):
     sent: list[dict[str, Any]] = []
 
