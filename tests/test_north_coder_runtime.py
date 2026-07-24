@@ -137,6 +137,7 @@ async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohtt
         return web.json_response(
             {
                 "conversation_id": f"conv-workdir-{suffix}",
+                "workspace_id": f"workspace-{suffix}",
                 "invocation_id": f"inv-workdir-{suffix}",
                 "status": "running",
             },
@@ -180,6 +181,7 @@ async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohtt
     )
 
     assert seen[0]["workdir"] == str(tmp_path)
+    assert seen[0]["register_workdir"] is True
     assert seen[0]["agent_yaml_path"] == "/tmp/hermes-agent.yaml"
     assert seen[0]["model_id"] == "ng-test-model"
     assert "gateway cwd history" in seen[0]["content"]
@@ -205,8 +207,105 @@ async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohtt
         "session-workdir": {
             "conversation_id": "conv-workdir-2",
             "workdir": str(changed_workdir),
+            "workspace_id": "workspace-2",
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_re_registers_legacy_workspace_less_binding(tmp_path, aiohttp_server):
+    """A pre-registration binding must not stay hidden from the North sidebar."""
+    state_file = tmp_path / "north_coder_conversations.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "legacy-session": {
+                    "conversation_id": "legacy-workspace-less",
+                    "workdir": str(tmp_path),
+                }
+            }
+        )
+    )
+    seen: list[dict[str, Any]] = []
+
+    async def composite_run(request):
+        seen.append(await request.json())
+        return web.json_response(
+            {
+                "conversation_id": "registered-conversation",
+                "workspace_id": "registered-workspace",
+                "invocation_id": "registered-invocation",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    async def invocation_result(_request):
+        return web.json_response(
+            {
+                "status": "completed",
+                "blocks": [
+                    {"role": "assistant", "block_type": "text", "content": "registered"}
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    result = await runtime.run_turn(
+        message="migrate me",
+        session_key="legacy-session",
+        hermes_session_id="hermes-session",
+        conversation_history=[{"role": "assistant", "content": "canonical context"}],
+        workdir=str(tmp_path),
+    )
+
+    assert seen[0]["register_workdir"] is True
+    assert "canonical context" in seen[0]["content"]
+    assert result["north_conversation_id"] == "registered-conversation"
+    assert json.loads(state_file.read_text())["legacy-session"] == {
+        "conversation_id": "registered-conversation",
+        "workdir": str(tmp_path),
+        "workspace_id": "registered-workspace",
+    }
+
+
+@pytest.mark.asyncio
+async def test_north_runtime_rejects_composite_run_without_workspace_binding(tmp_path, aiohttp_server):
+    async def composite_run(_request):
+        return web.json_response(
+            {
+                "conversation_id": "still-hidden",
+                "invocation_id": "inv-hidden",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="omitted workspace_id"):
+        await runtime.run_turn(
+            message="must be visible",
+            session_key="session-hidden",
+            hermes_session_id="hermes-session",
+            workdir=str(tmp_path),
+        )
+
+    assert not (tmp_path / "north_coder_conversations.json").exists()
 
 
 @pytest.mark.asyncio

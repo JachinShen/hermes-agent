@@ -89,10 +89,16 @@ class NorthCoderRuntime:
         effective_workdir = workdir or getattr(source, "workdir", None)
         if effective_workdir:
             effective_workdir = str(Path(effective_workdir).expanduser().resolve())
-        existing_id, existing_workdir = await self._conversation_binding(session_key)
+        existing_id, existing_workdir, existing_workspace_id = await self._conversation_binding(
+            session_key
+        )
         composite_run = bool(
             effective_workdir
-            and (not existing_id or existing_workdir != effective_workdir)
+            and (
+                not existing_id
+                or existing_workdir != effective_workdir
+                or not existing_workspace_id
+            )
         )
         if composite_run:
             conversation_id, created = "", True
@@ -136,7 +142,10 @@ class NorthCoderRuntime:
                 run_payload = {
                     "content": payload["content"],
                     "workdir": effective_workdir,
-                    "register_workdir": False,
+                    # Hermes sessions must be navigable from the North sidebar.
+                    # A bare workdir creates a workspace-less conversation that
+                    # North Studio intentionally cannot open.
+                    "register_workdir": True,
                     "agent_profile_id": self.config.agent_profile_id,
                     "metadata": payload["metadata"],
                     "conversation_options": {
@@ -168,10 +177,14 @@ class NorthCoderRuntime:
                     conversation_id = str(accepted.get("conversation_id") or "")
                     if not conversation_id:
                         raise RuntimeError("North composite run response omitted conversation_id")
+                    workspace_id = str(accepted.get("workspace_id") or "")
+                    if not workspace_id:
+                        raise RuntimeError("North composite run response omitted workspace_id")
                     await self._record_conversation_binding(
                         session_key,
                         conversation_id,
                         str(effective_workdir),
+                        workspace_id,
                     )
                 invocation_id = accepted.get("invocation_id")
                 if invocation_id:
@@ -554,16 +567,22 @@ class NorthCoderRuntime:
         return conversation_id
 
     @staticmethod
-    def _decode_binding(value: Any) -> tuple[Optional[str], Optional[str]]:
+    def _decode_binding(
+        value: Any,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         if isinstance(value, str) and value:
-            return value, None
+            return value, None, None
         if isinstance(value, dict):
             conversation_id = str(value.get("conversation_id") or "")
             workdir = str(value.get("workdir") or "")
-            return conversation_id or None, workdir or None
-        return None, None
+            workspace_id = str(value.get("workspace_id") or "")
+            return conversation_id or None, workdir or None, workspace_id or None
+        return None, None, None
 
-    async def _conversation_binding(self, session_key: str) -> tuple[Optional[str], Optional[str]]:
+    async def _conversation_binding(
+        self,
+        session_key: str,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         with self._state_lock:
             return self._decode_binding(self._read_state().get(session_key))
 
@@ -572,26 +591,28 @@ class NorthCoderRuntime:
         session_key: str,
         conversation_id: str,
         workdir: Optional[str],
+        workspace_id: str,
     ) -> None:
         with self._state_lock:
             state = self._read_state()
             state[session_key] = {
                 "conversation_id": conversation_id,
                 "workdir": workdir,
+                "workspace_id": workspace_id,
             }
             self._write_state(state)
 
     async def _conversation_for_turn(self, session_key: str) -> tuple[str, bool]:
         with self._state_lock:
             state = self._read_state()
-            existing, _ = self._decode_binding(state.get(session_key))
+            existing, _, _ = self._decode_binding(state.get(session_key))
             if existing:
                 return existing, False
 
         conversation_id = await self._create_conversation(session_key)
         with self._state_lock:
             state = self._read_state()
-            existing, _ = self._decode_binding(state.get(session_key))
+            existing, _, _ = self._decode_binding(state.get(session_key))
             if existing:
                 return existing, False
             state[session_key] = conversation_id
