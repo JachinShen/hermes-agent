@@ -4303,23 +4303,38 @@ def _make_north_workspace_switch_callback(
     from hermes_cli.projects_db import connect_closing
 
     def callback(ws: dict[str, Any]) -> Optional[str]:
-        project_id = ws.get("project_id", "")
-        if not project_id:
+        project_id_input = ws.get("project_id", "")
+        if not project_id_input:
             return "workspace_switch missing project_id"
 
         hermes_home = Path(_hermes_home)
         db_path = hermes_home / "projects.db"
 
-        # Phase 1: Resolve project by id from projects.db (canonical source)
+        # Phase 1: Resolve project by id, slug, or name from projects.db (canonical source)
+        # get_project already supports id-or-slug lookup (tries ID first, then slug).
+        # We also support name lookup for canonical records via exact match.
         try:
             if not db_path.is_file():
                 return f"no projects database at {db_path}"
             with connect_closing() as conn:
-                project = pdb.get_project(conn, project_id)
+                project = pdb.get_project(conn, str(project_id_input))
                 if project is None:
-                    return f"project '{project_id}' not found in projects.db"
+                    # Public canonical API: exact display-name fallback after the
+                    # id/slug resolver. Never trust a model-supplied path.
+                    project = next(
+                        (
+                            candidate
+                            for candidate in pdb.list_projects(conn)
+                            if candidate.name == str(project_id_input)
+                        ),
+                        None,
+                    )
+                    if project is None:
+                        return f"project '{project_id_input}' not found in projects.db"
+                # Use canonical project ID for all subsequent operations
+                project_id = str(project.id)
         except Exception as exc:
-            return f"failed to resolve project '{project_id}': {exc}"
+            return f"failed to resolve project '{project_id_input}': {exc}"
 
         # Phase 2: Resolve canonical path from the project, not the tool result
         primary_path = None

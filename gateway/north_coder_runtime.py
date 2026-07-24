@@ -335,7 +335,7 @@ class NorthCoderRuntime:
                     #   - WS先terminal时，仍等待REST reconcile（不立即cancel poll）
                     #   - 双方都永久running时，_poll_result的timeout_seconds硬deadline触发
                     poll_task = asyncio.ensure_future(
-                        self._poll_result(client, invocation_id, full_response, on_event)
+                        self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta)
                     )
                     # 等待最先完成的一方
                     done, pending = await asyncio.wait(
@@ -362,19 +362,31 @@ class NorthCoderRuntime:
                             raise
                         else:
                             # REST finished first — build terminal from authoritative result
+                            rest_tools = self._extract_result_tool_blocks(authoritative)
                             terminal = {
                                 "status": str(authoritative.get("status") or "completed"),
-                                "tools": [],
+                                "tools": rest_tools,
                             }
                             if authoritative.get("required_action"):
                                 terminal["required_action"] = authoritative["required_action"]
                             terminal["result"] = authoritative
-                            # When REST finishes first with text (silent WS/slow provider),
-                            # fill full_response so final_response is non-empty
-                            if not full_response:
-                                rest_text = self._extract_result_text(authoritative)
-                                if rest_text:
+                            # Incremental delta from REST text (silent WS/slow provider):
+                            # only append new suffix not yet in full_response.
+                            # When WS already made progress with different content
+                            # (REST text doesn't start with WS text), keep WS content.
+                            rest_text = self._extract_result_text(authoritative)
+                            if rest_text:
+                                current = "".join(full_response)
+                                if not full_response:
                                     full_response.append(rest_text)
+                                    if on_delta:
+                                        on_delta(rest_text)
+                                elif rest_text.startswith(current) and len(rest_text) > len(current):
+                                    suffix = rest_text[len(current):]
+                                    if suffix:
+                                        full_response.append(suffix)
+                                        if on_delta:
+                                            on_delta(suffix)
                     else:
                         # WS先terminal → 等待REST poll完成以reconcile
                         terminal = ws_task.result()
@@ -416,6 +428,9 @@ class NorthCoderRuntime:
                                 if authoritative.get("required_action"):
                                     terminal["required_action"] = authoritative["required_action"]
                                 terminal["result"] = authoritative
+                                rest_tools = self._extract_result_tool_blocks(authoritative)
+                                if rest_tools:
+                                    terminal.setdefault("tools", []).extend(rest_tools)
                         elif terminal.get("transport_error"):
                             # WS errored and no REST result — return structured failed
                             terminal["status"] = "failed"
@@ -430,7 +445,12 @@ class NorthCoderRuntime:
                         terminal["status"] = "failed"
                         terminal.setdefault("error", terminal["transport_error"])
             elif invocation_id:
-                terminal = await self._poll_result(client, invocation_id, full_response, on_event)
+                terminal = await self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta)
+                # REST-only path: extract tool_use blocks from raw result into tools
+                if terminal.get("blocks") and not terminal.get("tools"):
+                    rest_tools = self._extract_result_tool_blocks(terminal)
+                    if rest_tools:
+                        terminal["tools"] = rest_tools
 
         with self._active_lock:
             if self._active_invocations.get(session_key) == str(invocation_id or ""):
@@ -521,20 +541,30 @@ class NorthCoderRuntime:
     def extract_workspace_switch(self, terminal: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Extract a workspace_switch intent from tool events in the result.
 
-        Correlates tool_call_start events (carrying the tool name) with
-        tool_call_result events (carrying the result content) by tool call id.
-        Returns the parsed ``workspace_switch`` dict on success, or None on
-        any validation failure.
+        Two detection paths:
+
+        Phase 1-2 (WS events via tool_call_start+tool_call_result):
+          Correlates tool_call_start events (carrying the tool name) with
+          tool_call_result events (carrying the result content) by tool call id.
+          Returns the parsed ``workspace_switch`` dict on success, or None on
+          any validation failure.
+
+        Phase 3 (REST tool_use blocks — stop-tool format):
+          Real North 0.4 stop tools appear as ``tool_use`` blocks in the REST
+          ``result.blocks`` or ``terminal["tools"]``. Content is a JSON string
+          with ``name`` and ``input`` keys. No tool_call_start/result pairing.
 
         Rejection rules (must all pass):
           - Tool name must be ``project_switch``
-          - Result must not have ``isError`` set
+          - Result must not have ``isError`` set (Phase 1-2 only)
           - Content must be valid JSON
-          - JSON must have ``success: true`` and ``workspace_switch`` key
-          - ``workspace_switch.path`` must be absolute and exist on disk
+          - JSON must have ``success: true`` and ``workspace_switch`` key (Phase 1-2)
+            OR ``name: "project_switch"`` with ``input.project`` (Phase 3)
+          - When ``workspace_switch.path`` present, must be absolute (Phase 1-2)
         """
         tools = terminal.get("tools") or []
-        if not tools:
+        result_blocks = ((terminal.get("result") or {}).get("blocks") or []) if not tools else []
+        if not tools and not result_blocks:
             return None
 
         # Phase 1: collect tool call name mappings by id
@@ -551,7 +581,7 @@ class NorthCoderRuntime:
                 if name:
                     tool_names[call_id] = name
 
-        # Phase 2: inspect results
+        # Phase 2: inspect tool_call_result events
         for event in tools:
             if not isinstance(event, dict):
                 continue
@@ -589,6 +619,48 @@ class NorthCoderRuntime:
                 "project_id": str(ws.get("project_id", "")),
                 "project_name": str(ws.get("project_name", "")),
                 "path": str(Path(path).expanduser().resolve()),
+            }
+
+        # Phase 3: inspect tool_use blocks (REST stop-tool format, North 0.4)
+        # These may be in terminal["tools"] or terminal["result"]["blocks"]
+        tool_use_events: list[dict[str, Any]] = [
+            e
+            for e in tools
+            if isinstance(e, dict)
+            and str(e.get("block_type") or e.get("type") or "") == "tool_use"
+        ]
+        if not tool_use_events:
+            result_blocks = (terminal.get("result") or {}).get("blocks") or []
+            for blk in result_blocks:
+                if (
+                    isinstance(blk, dict)
+                    and str(blk.get("block_type") or blk.get("type") or "") == "tool_use"
+                ):
+                    tool_use_events.append(blk)
+
+        for event in tool_use_events:
+            content = event.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            try:
+                data = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("name") != "project_switch":
+                continue
+            inp = data.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            project = inp.get("project", "")
+            if not project:
+                continue
+            return {
+                "project_id": str(project),
+                "project_name": str(project),
+                "name": "project_switch",
+                "input": inp,
             }
         return None
 
@@ -747,7 +819,7 @@ class NorthCoderRuntime:
                 finally:
                     await ws.close()
             else:
-                terminal = await self._poll_result(client, resumed_id, full_response, on_event)
+                terminal = await self._poll_result(client, resumed_id, full_response, on_event, on_delta=on_delta)
         text = "".join(full_response)
         status = str(terminal.get("status") or "completed")
         return {
@@ -852,7 +924,10 @@ class NorthCoderRuntime:
         if not isinstance(blocks, list):
             return []
         for block in reversed(blocks):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if (
+                not isinstance(block, dict)
+                or str(block.get("block_type") or block.get("type") or "") != "tool_use"
+            ):
                 continue
             payload = block
             if not payload.get("name") and isinstance(payload.get("content"), str):
@@ -868,6 +943,19 @@ class NorthCoderRuntime:
             if isinstance(input_payload, dict) and isinstance(input_payload.get("questions"), list):
                 return [item for item in input_payload["questions"] if isinstance(item, dict)]
         return []
+
+    @staticmethod
+    def _extract_result_tool_blocks(result: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return North REST tool-use blocks across 0.3/0.4 field names."""
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return []
+        return [
+            block
+            for block in blocks
+            if isinstance(block, dict)
+            and str(block.get("block_type") or block.get("type") or "") == "tool_use"
+        ]
 
     @staticmethod
     def _extract_result_text(result: dict[str, Any]) -> str:
@@ -888,7 +976,7 @@ class NorthCoderRuntime:
                 parts.append(content)
         return "".join(parts)
 
-    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback]) -> dict[str, Any]:
+    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback], *, on_delta: Optional[DeltaCallback] = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.timeout_seconds
         while time.monotonic() < deadline:
             async with client.get(f"{self.config.base_url}/api/invocations/{invocation_id}/result") as response:
@@ -901,8 +989,22 @@ class NorthCoderRuntime:
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
             text = self._extract_result_text(result)
-            if text and not full_response:
-                full_response.append(str(text))
+            if text:
+                # Incremental delta: only append new suffix not yet in full_response
+                current = "".join(full_response)
+                if not current.startswith(text) and not text.startswith(current):
+                    # Different content or first chunk — use text as-is
+                    if not full_response:
+                        full_response.append(text)
+                        if on_delta:
+                            on_delta(text)
+                elif len(text) > len(current):
+                    # Text has grown — only emit the new suffix
+                    suffix = text[len(current):]
+                    if suffix:
+                        full_response.append(suffix)
+                        if on_delta:
+                            on_delta(suffix)
             status = str(result.get("status") or "")
             required_action = result.get("required_action")
             if isinstance(required_action, dict) and required_action.get("type") == "ask_user":

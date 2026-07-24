@@ -689,3 +689,156 @@ async def test_gateway_direct_run_turn_workspace_switch_unsupported(tmp_path, ai
     # No cwd change: run_turn with workdir should not alter host cwd
     assert os.getcwd() != str(tmp_path / "work"), \
         "Host cwd must NOT be changed by run_turn"
+
+
+# =========================================================================
+# Contract: _make_north_workspace_switch_callback name/slug/id resolution
+# =========================================================================
+
+
+def test_callback_resolve_by_slug(monkeypatch, tmp_path):
+    """_make_north_workspace_switch_callback resolves project by slug
+    when project_id_input is a slug."""
+    import tui_gateway.server as server
+    import hermes_constants
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    proj_path = home / "proj"
+    proj_path.mkdir()
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-slug-resolve"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+
+        with pdb.connect_closing() as conn:
+            proj_id = pdb.create_project(
+                conn, name="My Project", slug="my-project",
+                folders=[str(proj_path)], primary_path=str(proj_path),
+            )
+
+        # Use the callback live path with monkeypatched _apply_project_workspace
+        monkeypatch.setattr(server, "_apply_project_workspace",
+                            lambda task_id, path, _name="": True)
+
+        server._sessions[sid] = {"session_key": sid, "cwd": str(proj_path), "agent": None}
+        try:
+            cb = server._make_north_workspace_switch_callback(sid)
+            result = cb({"project_id": "my-project"})
+            assert result is None, f"slug lookup should succeed, got: {result}"
+        finally:
+            server._sessions.pop(sid, None)
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_callback_resolve_by_name(monkeypatch, tmp_path):
+    """_make_north_workspace_switch_callback resolves project by exact
+    canonical name when project_id_input is a name (not id or slug)."""
+    import tui_gateway.server as server
+    import hermes_constants
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    proj_path = home / "proj"
+    proj_path.mkdir()
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-name-resolve"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+
+        with pdb.connect_closing() as conn:
+            proj_id = pdb.create_project(
+                conn, name="My Cool Project", slug="my-cool-project",
+                folders=[str(proj_path)], primary_path=str(proj_path),
+            )
+
+        monkeypatch.setattr(server, "_apply_project_workspace",
+                            lambda task_id, path, _name="": True)
+
+        server._sessions[sid] = {"session_key": sid, "cwd": str(proj_path), "agent": None}
+        try:
+            cb = server._make_north_workspace_switch_callback(sid)
+            # Use the canonical name (not slug, not id)
+            result = cb({"project_id": "My Cool Project"})
+            assert result is None, f"name lookup should succeed, got: {result}"
+        finally:
+            server._sessions.pop(sid, None)
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_callback_resolve_by_id(monkeypatch, tmp_path):
+    """_make_north_workspace_switch_callback resolves project by id."""
+    import tui_gateway.server as server
+    import hermes_constants
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    proj_path = home / "proj"
+    proj_path.mkdir()
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-id-resolve"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+
+        with pdb.connect_closing() as conn:
+            proj_id = pdb.create_project(
+                conn, name="ID Project", slug="id-project",
+                folders=[str(proj_path)], primary_path=str(proj_path),
+            )
+
+        monkeypatch.setattr(server, "_apply_project_workspace",
+                            lambda task_id, path, _name="": True)
+
+        server._sessions[sid] = {"session_key": sid, "cwd": str(proj_path), "agent": None}
+        try:
+            cb = server._make_north_workspace_switch_callback(sid)
+            # Use the canonical id
+            result = cb({"project_id": proj_id})
+            assert result is None, f"id lookup should succeed, got: {result}"
+        finally:
+            server._sessions.pop(sid, None)
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_callback_resolve_name_fallback_not_found(monkeypatch, tmp_path):
+    """When name doesn't match, callback returns error (not crash)."""
+    import tui_gateway.server as server
+    import hermes_constants
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    proj_path = home / "proj"
+    proj_path.mkdir()
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-name-not-found"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+
+        with pdb.connect_closing() as conn:
+            pdb.create_project(
+                conn, name="Real Project", slug="real-project",
+                folders=[str(proj_path)], primary_path=str(proj_path),
+            )
+
+        server._sessions[sid] = {"session_key": sid, "cwd": str(proj_path), "agent": None}
+        try:
+            cb = server._make_north_workspace_switch_callback(sid)
+            result = cb({"project_id": "Nonexistent Project"})
+            assert result is not None, "non-existent name should return error"
+            assert "not found" in result.lower(), \
+                f"error should mention not found, got: {result}"
+        finally:
+            server._sessions.pop(sid, None)
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
