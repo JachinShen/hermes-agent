@@ -318,39 +318,117 @@ class NorthCoderRuntime:
                     logger.warning("North event stream unavailable; falling back to invocation polling: %s", exc)
 
             if ws is not None:
-                try:
-                    terminal = await self._consume_events(
+                ws_task = asyncio.ensure_future(
+                    self._consume_events(
                         ws,
                         full_response,
                         on_delta,
                         on_event,
                         process_replay=composite_run,
                     )
-                finally:
-                    await ws.close()
-                # WebSocket run_finished is progress only; the REST invocation
-                # status is authoritative because a finished run may pause in
-                # requires_action.
-                # When the WebSocket errored (transport_error), partial deltas
-                # from the failed stream are replaced by the REST full text.
+                )
                 if invocation_id:
-                    if terminal.get("transport_error"):
-                        full_response.clear()
-                    try:
-                        authoritative = await self._poll_result(client, invocation_id, full_response, on_event)
-                    except Exception as exc:
-                        logger.warning("North invocation status reconciliation unavailable: %s", exc)
+                    # 并发：WS消费 vs REST轮询。谁先terminal就用谁。
+                    # 此设计解决North静默WS导致无限卡住的问题：
+                    #   - REST先terminal（failed/cancelled/completed/requires_action）
+                    #     时，结束WS消费并快速返回
+                    #   - WS先terminal时，仍等待REST reconcile（不立即cancel poll）
+                    #   - 双方都永久running时，_poll_result的timeout_seconds硬deadline触发
+                    poll_task = asyncio.ensure_future(
+                        self._poll_result(client, invocation_id, full_response, on_event)
+                    )
+                    # 等待最先完成的一方
+                    done, pending = await asyncio.wait(
+                        [ws_task, poll_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    # REST先terminal → 取消WS
+                    if poll_task in done and not poll_task.cancelled():
+                        ws_task.cancel()
+                        try:
+                            await ws_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        await ws.close()
+
+                        try:
+                            authoritative = poll_task.result()
+                        except (TimeoutError, asyncio.TimeoutError):
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "North REST poll finished first but failed: %s", exc
+                            )
+                            raise
+                        else:
+                            # REST finished first — build terminal from authoritative result
+                            terminal = {
+                                "status": str(authoritative.get("status") or "completed"),
+                                "tools": [],
+                            }
+                            if authoritative.get("required_action"):
+                                terminal["required_action"] = authoritative["required_action"]
+                            terminal["result"] = authoritative
+                            # When REST finishes first with text (silent WS/slow provider),
+                            # fill full_response so final_response is non-empty
+                            if not full_response:
+                                rest_text = self._extract_result_text(authoritative)
+                                if rest_text:
+                                    full_response.append(rest_text)
                     else:
-                        if authoritative.get("status"):
-                            terminal["status"] = authoritative["status"]
-                        if authoritative.get("required_action"):
-                            terminal["required_action"] = authoritative["required_action"]
-                        terminal["result"] = authoritative
-                elif terminal.get("transport_error"):
-                    # WebSocket errored and there is no invocation to poll.
-                    # Return a structured failed state instead of fake completed.
-                    terminal["status"] = "failed"
-                    terminal.setdefault("error", terminal["transport_error"])
+                        # WS先terminal → 等待REST poll完成以reconcile
+                        terminal = ws_task.result()
+                        if terminal.get("transport_error"):
+                            full_response.clear()
+                        # 等待REST poll完成（有超时保护：剩余timeout_seconds硬deadline）
+                        try:
+                            rest_done, rest_pending = await asyncio.wait(
+                                [poll_task],
+                                timeout=self.config.timeout_seconds,
+                            )
+                        finally:
+                            await ws.close()
+                        # Cancel REST poll if still running (shouldn't happen
+                        # since _poll_result has its own deadline, but safety net)
+                        for t in (rest_pending or []):
+                            t.cancel()
+                            try:
+                                await t
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+                        if rest_done and not poll_task.cancelled():
+                            try:
+                                authoritative = poll_task.result()
+                            except Exception as exc:
+                                logger.warning(
+                                    "North invocation status reconciliation unavailable: %s",
+                                    exc,
+                                )
+                                # REST reconcile failed/excepted — if WS also
+                                # had transport_error, surface structured failed
+                                if terminal.get("transport_error"):
+                                    terminal["status"] = "failed"
+                                    terminal.setdefault("error", str(exc))
+                            else:
+                                if authoritative.get("status"):
+                                    terminal["status"] = authoritative["status"]
+                                if authoritative.get("required_action"):
+                                    terminal["required_action"] = authoritative["required_action"]
+                                terminal["result"] = authoritative
+                        elif terminal.get("transport_error"):
+                            # WS errored and no REST result — return structured failed
+                            terminal["status"] = "failed"
+                            terminal.setdefault("error", terminal["transport_error"])
+                else:
+                    # No invocation_id to poll — consume WS only
+                    try:
+                        terminal = await ws_task
+                    finally:
+                        await ws.close()
+                    if terminal.get("transport_error"):
+                        terminal["status"] = "failed"
+                        terminal.setdefault("error", terminal["transport_error"])
             elif invocation_id:
                 terminal = await self._poll_result(client, invocation_id, full_response, on_event)
 
@@ -708,7 +786,19 @@ class NorthCoderRuntime:
         replaying = False
         terminal: dict[str, Any] = {"status": "completed", "tools": []}
         while True:
-            item = await ws.receive()
+            try:
+                item = await asyncio.wait_for(
+                    ws.receive(),
+                    timeout=self.config.timeout_seconds,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "North event stream timed out (no message for %.0fs); "
+                    "falling back to REST polling for invocation",
+                    self.config.timeout_seconds,
+                )
+                terminal["transport_error"] = f"event stream timeout ({self.config.timeout_seconds}s)"
+                break
             if item.type.name in {"CLOSED", "CLOSE", "CLOSING"}:
                 break
             if item.type.name == "ERROR":
