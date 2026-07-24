@@ -278,6 +278,10 @@ class TestSlackSubcommandMap:
         assert "bg" in mapping
         assert "reset" in mapping
 
+    def test_runtime_is_always_reachable_via_hermes_catchall(self):
+        """A stale Slack manifest can still switch runtimes through /hermes."""
+        assert slack_subcommand_map()["runtime"] == "/runtime"
+
     def test_excludes_cli_only_without_config_gate(self):
         mapping = slack_subcommand_map()
         for cmd in COMMAND_REGISTRY:
@@ -328,6 +332,10 @@ class TestSlackNativeSlashes:
         # Sample of gateway-available canonical commands
         for expected in ("new", "stop", "background", "model", "help"):
             assert expected in names, f"missing canonical /{expected}"
+
+    def test_includes_runtime_when_manifest_is_refreshed(self):
+        names = {n for n, _d, _h in slack_native_slashes()}
+        assert "runtime" in names
 
     def test_excludes_slack_reserved_commands(self):
         """Slack built-in commands (e.g. /status, /me, /join) cannot be

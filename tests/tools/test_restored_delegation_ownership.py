@@ -88,6 +88,73 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
     assert "restored" not in json.loads(row[0])
 
 
+def test_restore_terminally_acknowledges_legacy_event_with_no_return_address(
+    tmp_path, monkeypatch,
+):
+    """Ownerless legacy cron/CLI results must not replay on every process start."""
+    import tools.async_delegation as ad
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    record = {
+        "delegation_id": "d-ownerless",
+        "goal": "old cron task",
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "m",
+        "session_key": "",
+        "origin_ui_session_id": "",
+        "parent_session_id": "cron_old",
+        "status": "running",
+        "dispatched_at": 1.0,
+        "completed_at": None,
+        "interrupt_fn": None,
+    }
+    ad._persist_dispatch(record)
+    evt = _delegation_event(session_key="", delegation_id="d-ownerless")
+    ad._persist_completion(evt, {"summary": "already returned by cron"})
+
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == 0
+    assert q.empty()
+    durable = ad.get_durable_delegation("d-ownerless")
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
+    # A second process start has nothing left to replay.
+    assert ad.restore_undelivered_completions(q) == 0
+
+
+def test_restore_repairs_missing_event_route_from_durable_columns(tmp_path, monkeypatch):
+    """Normalized routing columns rescue old event_json missing its session key."""
+    import tools.async_delegation as ad
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    record = {
+        "delegation_id": "d-repair",
+        "goal": "old routed task",
+        "session_key": "agent:main:slack:group:C1:T1",
+        "origin_ui_session_id": "",
+        "parent_session_id": "parent",
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {
+            "type": "async_delegation",
+            "delegation_id": "d-repair",
+            "status": "completed",
+            "completed_at": 2.0,
+        },
+        {"summary": "result"},
+    )
+
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == 1
+    restored = q.get_nowait()
+    assert restored["session_key"] == "agent:main:slack:group:C1:T1"
+    assert restored["restored"] is True
+
+
 def test_unfiltered_drain_never_consumes_restored_events():
     """The legacy consume-everything branch must fail closed on restored events."""
     reg = _make_registry()
