@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from agent.skill_utils import is_excluded_skill_path
-from hermes_constants import get_hermes_home
 
 
 def _skill_manage_tool_yaml() -> str:
@@ -183,6 +182,48 @@ _CORE_NORTH_TOOLS = (
     ("write_todos", "session.write_todos"),
 )
 
+# Tools with large output that benefit from tool_result_compaction.
+# Must be a strict subset of exported tools that actually exist in the profile.
+_COMPACTABLE_TOOLS = (
+    "read_file",
+    "write_file",
+    "apply_patch",
+    "search_file_content",
+    "run_shell_command",
+    "web_search",
+    "web_read",
+    "background_task_manage",
+)
+
+
+def _middlewares_yaml() -> str:
+    """Return the ``middlewares:`` block for agent.yaml.
+
+    Dual context compaction:
+      - tier-2: LLM-summary compaction (token threshold, emergency-capable)
+      - tier-1: time-based tool-result compaction (fine-grained, periodic)
+    """
+    return """middlewares:
+  # tier-2: full-compact（token 阈值触发 + LLM 摘要）
+  # 顺序在前：手动 Compact Now 走 compaction_middlewares[0]，优先 LLM 摘要。
+  - import: nexau_builtin_middlewares:ContextCompactionMiddleware
+    params:
+      auto_compact: true
+      emergency_compact_enabled: true
+      threshold: 0.90
+      compaction_strategy: llm_summary
+      keep_iterations: 5
+  # tier-1: micro-compact（时间触发 + 工具结果替换 + 类型过滤）
+  - import: nexau_builtin_middlewares:ContextCompactionMiddleware
+    params:
+      trigger: time_based
+      gap_threshold_minutes: 5
+      auto_compact: true
+      emergency_compact_enabled: false
+      compaction_strategy: tool_result_compaction
+      keep_iterations: 20
+      compactable_tools:\n""" + "".join(f"        - {t}\n" for t in _COMPACTABLE_TOOLS)
+
 
 def export_hermes_profile(
     hermes_home: Path,
@@ -190,8 +231,17 @@ def export_hermes_profile(
     *,
     name: str = "hermes-profile",
     config: dict[str, Any] | None = None,
+    tui_variant: bool = False,
 ) -> Path:
-    """Write a North-compatible artifact and return its ``agent.yaml`` path."""
+    """Write a North-compatible artifact and return its ``agent.yaml`` path.
+
+    When *tui_variant* is True, returns the ``agent-tui.yaml`` path instead.
+    The TUI variant includes ``project_list`` and ``project_switch`` tools
+    (with ``project_switch`` in ``stop_tools``) that are read-only intent
+    queries against the Hermes projects.db.  The shared ``agent.yaml`` never
+    exposes these tools — only Gateway/Slack managed profiles may consume
+    them.
+    """
     config = config or _read_config(hermes_home)
     agent_cfg_raw = config.get("agent")
     agent_cfg: dict[str, Any] = agent_cfg_raw if isinstance(agent_cfg_raw, dict) else {}
@@ -221,6 +271,10 @@ def export_hermes_profile(
     (custom_tools_dir / "memory_bridge.py").write_text(
         _memory_bridge_py(hermes_home), encoding="utf-8"
     )
+    if tui_variant:
+        (custom_tools_dir / "project_bridge.py").write_text(
+            _project_bridge_py(hermes_home), encoding="utf-8"
+        )
 
     skill_paths = sorted(
         str(path.parent)
@@ -249,6 +303,8 @@ def export_hermes_profile(
         "sandbox_config:",
         "  type: local",
         "",
+        _middlewares_yaml().rstrip(),
+        "",
         "tools:",
     ]
     for tool_name, builtin in _CORE_NORTH_TOOLS:
@@ -265,7 +321,140 @@ def export_hermes_profile(
         lines.extend(["", "skills:"])
         lines.extend(f"  - {path}" for path in skill_paths)
     (output_dir / "agent.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if tui_variant:
+        _write_tui_variant(output_dir, lines)
+        return output_dir / "agent-tui.yaml"
     return output_dir / "agent.yaml"
+
+
+def _project_bridge_py(hermes_home: Path) -> str:
+    """Generate a self-contained project_bridge.py that bakes hermes_home
+    and paths, like memory_bridge.py and skill_manage_bridge.py.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    venv_python = Path(sys.executable)
+    helper = r'''import json, os, subprocess
+
+
+def project_list_intent():
+    env = os.environ.copy()
+    env["HERMES_HOME"] = __HERMES_HOME__
+    env["PYTHONPATH"] = __REPO_ROOT__ + os.pathsep + env.get("PYTHONPATH", "")
+    code = """
+import json, sys
+from tools.north_actions import project_list_intent
+print(project_list_intent())
+"""
+    proc = subprocess.run(
+        [__VENV_PYTHON__, "-c", code], text=True,
+        capture_output=True, env=env,
+    )
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or "Hermes project_list_intent helper failed")
+    return proc.stdout.strip()
+
+
+def project_switch_intent(project: str):
+    env = os.environ.copy()
+    env["HERMES_HOME"] = __HERMES_HOME__
+    env["PYTHONPATH"] = __REPO_ROOT__ + os.pathsep + env.get("PYTHONPATH", "")
+    code = """
+import json, sys
+from tools.north_actions import project_switch_intent
+print(project_switch_intent(**json.loads(sys.stdin.read())))
+"""
+    proc = subprocess.run(
+        [__VENV_PYTHON__, "-c", code], input=json.dumps({"project": project}),
+        text=True, capture_output=True, env=env,
+    )
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or "Hermes project_switch_intent helper failed")
+    return proc.stdout.strip()
+'''
+    return (
+        helper.replace("__HERMES_HOME__", repr(str(hermes_home)))
+        .replace("__REPO_ROOT__", repr(str(repo_root)))
+        .replace("__VENV_PYTHON__", repr(str(venv_python)))
+    )
+
+
+def _write_tui_variant(output_dir: Path, base_lines: list[str]) -> None:
+    """Write agent-tui.yaml — includes project_list and project_switch tools.
+
+    The shared agent.yaml must NOT expose project tools (Gateway/Slack
+    managed profiles).  Only the TUI North variant provides them, with
+    project_switch listed in top-level stop_tools so North pauses before
+    executing it.  The tool bindings reference the self-contained
+    project_bridge.py in custom_tools/, baked with the Hermes home path.
+    """
+    tui_tools_yaml = r"""  - name: project_list
+    yaml_path: ./tools/project_list.tool.yaml
+    binding: ./custom_tools/project_bridge.py:project_list_intent
+  - name: project_switch
+    yaml_path: ./tools/project_switch.tool.yaml
+    binding: ./custom_tools/project_bridge.py:project_switch_intent
+"""
+    # Insert project tools after skill_manage entry
+    tui_lines = list(base_lines)
+    skill_manage_idx = None
+    for i, line in enumerate(tui_lines):
+        stripped = line.strip()
+        if stripped == "binding: ./custom_tools/skill_manage_bridge.py:skill_manage":
+            skill_manage_idx = i + 1
+            break
+    if skill_manage_idx is not None:
+        extra_lines = tui_tools_yaml.rstrip("\n").split("\n")
+        tui_lines[skill_manage_idx:skill_manage_idx] = ["", "# Project tools (TUI-only, read-only intents)"] + extra_lines
+    else:
+        # Fallback: append before skills section
+        skill_idx = None
+        for i, line in enumerate(tui_lines):
+            if line.strip() == "skills:" and not line.startswith(" "):
+                skill_idx = i
+                break
+        insert_at = skill_idx if skill_idx is not None else len(tui_lines)
+        tui_lines[insert_at:insert_at] = ["", "# Project tools (TUI-only, read-only intents)"] + tui_tools_yaml.rstrip("\n").split("\n")
+
+    # Write project tool YAML specs
+    _write_project_tool_yamls(output_dir)
+    tui_output = "\n".join(tui_lines) + "\n"
+    # Top-level stop_tools: project_switch pauses before execution
+    tui_output += "stop_tools:\n  - project_switch\n"
+    (output_dir / "agent-tui.yaml").write_text(tui_output, encoding="utf-8")
+
+
+def _write_project_tool_yamls(output_dir: Path) -> None:
+    """Write the tool YAML specs for project_list and project_switch."""
+    tool_dir = output_dir / "tools"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+
+    (tool_dir / "project_list.tool.yaml").write_text("""type: tool
+name: project_list
+description: >-
+  List desktop Projects (named workspaces) and show which one is active.
+  A pure read-only query against the Hermes projects database — no side
+  effects, no DB mutations, no cwd changes.
+input_schema:
+  type: object
+  properties: {}
+""", encoding="utf-8")
+
+    (tool_dir / "project_switch.tool.yaml").write_text("""type: tool
+name: project_switch
+description: >-
+  Switch to a desktop Project by name, slug, or id.  This is a pure intent:
+  the tool validates the project exists and its primary_path is a directory,
+  then returns structured JSON for the host to apply the switch.
+  The host applies the actual project switch (set_active, cwd, sidebar).
+input_schema:
+  type: object
+  properties:
+    project:
+      type: string
+      description: Project name, slug, or id
+  required:
+    - project
+""", encoding="utf-8")
 
 
 def _read_config(hermes_home: Path) -> dict[str, Any]:

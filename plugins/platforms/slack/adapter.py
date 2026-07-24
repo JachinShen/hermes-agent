@@ -4536,7 +4536,10 @@ class SlackAdapter(BasePlatformAdapter):
                     else subcommand_map[first_word]
                 )
             elif text:
-                pass  # Treat as a regular question
+                # Free-form question via /hermes — text is already just the
+                # user's question (Slack separates command from text).  Treat
+                # as a regular message; message_type is set to TEXT below.
+                pass
             else:
                 text = "/help"
         else:

@@ -54,10 +54,21 @@ def test_generated_memory_bridge_writes_both_hermes_targets(tmp_path):
 
 def test_north_tui_agent_forwards_tool_lifecycle_callbacks():
     class FakeRuntime:
+        def __init__(self):
+            self.config = type("Config", (), {
+                "tui_variant": True,
+                "workspace_switch_supported": True,
+                "agent_yaml_path": None,
+            })()
+            self.hermes_home = Path("/tmp")
+
         async def run_turn(self, **kwargs):
             kwargs["on_event"]({"type": "tool_call_start", "toolCallId": "t-1", "toolCallName": "read_file"})
             kwargs["on_event"]({"type": "tool_call_result", "toolCallId": "t-1", "content": "ok"})
             return {"messages": [], "north_invocation_id": "inv-1"}
+
+        def extract_workspace_switch(self, terminal):
+            return None
 
     events = []
     agent = NorthCoderTUIAgent(cast(Any, FakeRuntime()), "session-1")
@@ -544,8 +555,8 @@ async def test_north_runtime_refreshes_managed_profile_once_per_new_conversation
     calls: list[tuple[Path, Path, str]] = []
     managed_yaml = tmp_path / "north-coder-profile" / "agent.yaml"
 
-    def fake_export(home: Path, output: Path, *, name: str):
-        calls.append((home, output, name))
+    def fake_export(home: Path, output: Path, *, name: str, tui_variant: bool = False):
+        calls.append((home, output, name, tui_variant))
         output.mkdir(parents=True, exist_ok=True)
         managed_yaml.write_text("type: agent\n", encoding="utf-8")
         return managed_yaml
@@ -569,7 +580,7 @@ async def test_north_runtime_refreshes_managed_profile_once_per_new_conversation
 
     assert await runtime._conversation_id("slack:C:thread") == "conv-refreshed"
     assert await runtime._conversation_id("slack:C:thread") == "conv-refreshed"
-    assert calls == [(tmp_path, managed_yaml.parent, "hermes-default")]
+    assert calls == [(tmp_path, managed_yaml.parent, "hermes-default", False)]
 
     custom_yaml = tmp_path / "custom-profile" / "agent.yaml"
     custom_runtime = NorthCoderRuntime(
@@ -578,7 +589,7 @@ async def test_north_runtime_refreshes_managed_profile_once_per_new_conversation
     )
     custom_runtime._refresh_managed_profile()
     assert not custom_yaml.exists()
-    assert calls == [(tmp_path, managed_yaml.parent, "hermes-default")]
+    assert calls == [(tmp_path, managed_yaml.parent, "hermes-default", False)]
 
 
 def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path):
@@ -626,6 +637,76 @@ def test_profile_export_omits_credentials_and_preserves_profile_context(tmp_path
     memory_bridge = (agent_yaml.parent / "custom_tools" / "memory_bridge.py").read_text()
     assert str(home) in memory_bridge
     assert "target" in memory_bridge
+
+
+def test_profile_export_middlewares_contract(tmp_path):
+    """Behavioral contract for dual context compaction middlewares.
+
+    Validates that the exported agent.yaml emits exactly two
+    ContextCompactionMiddleware entries with the correct strategy,
+    ordering, parameters, and compactable_tools subset invariant.
+
+    NOTE: Full North/NexAU Rust parser validation (agent/code_agent.yaml
+    deserialization) is not available from Python test context.  YAML
+    parse + structural assertions serve as the Python-side gate.
+    """
+    import yaml
+
+    from hermes_cli.north_coder_profile import (
+        _COMPACTABLE_TOOLS,
+        _CORE_NORTH_TOOLS,
+        export_hermes_profile,
+    )
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text("agent:\n  max_turns: 99\n")
+    yaml_path = export_hermes_profile(home, tmp_path / "north-profile", name="hermes-test")
+
+    data = yaml.safe_load(yaml_path.read_text())
+
+    # ── middlewares section exists and has correct shape ──
+    mws = data.get("middlewares")
+    assert mws is not None, "exported agent.yaml MUST include middlewares"
+    assert isinstance(mws, list), "middlewares MUST be a sequence"
+    assert len(mws) == 2, "exactly 2 ContextCompactionMiddleware entries required"
+
+    # ── ordering invariant: [0] = llm_summary (tier-2 full), [1] = time_based (tier-1 micro) ──
+    llm, tb = mws
+
+    # --- tier-2: LLM summary compaction ---
+    assert llm["import"] == "nexau_builtin_middlewares:ContextCompactionMiddleware"
+    p = llm["params"]
+    assert p["compaction_strategy"] == "llm_summary", "first middleware must be llm_summary"
+    assert p["auto_compact"] is True
+    assert p["emergency_compact_enabled"] is True, "llm_summary must support emergency"
+    assert p["threshold"] == 0.90
+    assert p["keep_iterations"] == 5
+
+    # --- tier-1: time-based tool_result_compaction ---
+    assert tb["import"] == "nexau_builtin_middlewares:ContextCompactionMiddleware"
+    p = tb["params"]
+    assert p["trigger"] == "time_based", "second middleware must be time_based"
+    assert p["gap_threshold_minutes"] == 5
+    assert p["compaction_strategy"] == "tool_result_compaction"
+    assert p["auto_compact"] is True
+    assert p["emergency_compact_enabled"] is False, "time_based must not trigger emergency"
+    assert p["keep_iterations"] == 20
+
+    # ── compactable_tools: strict subset of exported profile tools ──
+    exported_names = {t[0] for t in _CORE_NORTH_TOOLS}
+    ct = p["compactable_tools"]
+    assert isinstance(ct, list), "compactable_tools MUST be a list"
+    assert len(ct) > 0, "compactable_tools MUST NOT be empty"
+    assert set(ct).issubset(exported_names), (
+        f"compactable_tools {set(ct) - exported_names} not in exported tools"
+    )
+    assert ct == list(_COMPACTABLE_TOOLS), (
+        f"compactable_tools mismatch: expected {list(_COMPACTABLE_TOOLS)}, got {ct}"
+    )
+    # _COMPACTABLE_TOOLS itself is a tuple (immutable, hashable) but
+    # YAML serialization always produces a list — validate both shapes.
+    assert isinstance(_COMPACTABLE_TOOLS, tuple), "_COMPACTABLE_TOOLS must be a tuple"
 
 
 def test_profile_export_uses_safe_independently_enabled_memory_snapshots(tmp_path):
@@ -717,3 +798,180 @@ async def test_north_runtime_resolves_permission_and_answers_ask_user(tmp_path, 
     answer_payload = seen[1][1]
     assert answer_payload["metadata"]["ask_user_response"]["tool_call_id"] == "ask-1"
     assert answer_payload["metadata"]["ask_user_response"]["answers"][0]["type"] == "text"
+
+
+# ------------------------------------------------------------------
+# Idempotent cancel: at most one POST per invocation_id
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_north_cancel_idempotent_same_inflight_only_one_post(tmp_path, aiohttp_server):
+    """Repeated cancel_session_async for the same in-flight invocation
+    must produce at most one POST to the cancel endpoint."""
+    accepted = asyncio.Event()
+    release = asyncio.Event()
+    cancel_calls: list[str] = []
+
+    async def composite_run(_request):
+        accepted.set()
+        await release.wait()
+        return web.json_response({
+            "conversation_id": "conv-idem-1",
+            "workspace_id": "home-default",
+            "invocation_id": "inv-idem-1",
+            "status": "running",
+        }, status=202)
+
+    async def cancel_invocation(request):
+        cancel_calls.append(request.match_info["invocation_id"])
+        return web.json_response({"status": "cancelled"})
+
+    async def invocation_result(_request):
+        return web.json_response({"status": "cancelled", "blocks": []})
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_post("/api/invocations/{invocation_id}/cancel", cancel_invocation)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    turn = asyncio.create_task(
+        runtime.run_turn(
+            message="idempotent test",
+            session_key="session-idem-1",
+            hermes_session_id="h-idem-1",
+            workspace_id="home-default",
+        )
+    )
+    await accepted.wait()
+
+    # Two identical cancel calls while the same invocation is in-flight
+    await runtime.cancel_session_async("session-idem-1")
+    await asyncio.sleep(0.05)
+    await runtime.cancel_session_async("session-idem-1")
+    await asyncio.sleep(0.05)
+    release.set()
+    result = await turn
+
+    assert result["interrupted"] is True
+    # Exactly one POST, even though cancel was called twice
+    assert len(cancel_calls) == 1
+    assert cancel_calls == ["inv-idem-1"]
+
+
+@pytest.mark.asyncio
+async def test_north_cancel_idempotent_before_and_after_id(tmp_path, aiohttp_server):
+    """Cancel before invocation_id arrives (queued in _cancel_requested)
+    followed by cancel after id arrives must produce at most one POST."""
+    accepted = asyncio.Event()
+    release_response = asyncio.Event()
+    cancel_calls: list[str] = []
+
+    async def composite_run(_request):
+        accepted.set()
+        await release_response.wait()
+        return web.json_response({
+            "conversation_id": "conv-idem-2",
+            "workspace_id": "home-default",
+            "invocation_id": "inv-idem-2",
+            "status": "running",
+        }, status=202)
+
+    async def cancel_invocation(request):
+        cancel_calls.append(request.match_info["invocation_id"])
+        return web.json_response({"status": "cancelled"})
+
+    async def invocation_result(_request):
+        return web.json_response({"status": "cancelled", "blocks": []})
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_post("/api/invocations/{invocation_id}/cancel", cancel_invocation)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    turn = asyncio.create_task(
+        runtime.run_turn(
+            message="idempotent before id",
+            session_key="session-idem-2",
+            hermes_session_id="h-idem-2",
+            workspace_id="home-default",
+        )
+    )
+    await accepted.wait()
+
+    # Cancel before invocation_id exists — queued in _cancel_requested
+    await runtime.cancel_session_async("session-idem-2")
+    await asyncio.sleep(0.05)
+
+    # Cancel again while invocation_id is already tracked
+    await runtime.cancel_session_async("session-idem-2")
+    await asyncio.sleep(0.05)
+
+    release_response.set()
+    result = await turn
+
+    assert result["interrupted"] is True
+    # Exactly one POST from the deferred path
+    assert len(cancel_calls) == 1
+    assert cancel_calls == ["inv-idem-2"]
+
+
+@pytest.mark.asyncio
+async def test_north_cancel_idempotent_finished_is_noop(tmp_path, aiohttp_server):
+    """cancel_session_async after run_turn completes must be a no-op
+    (no POST, no error)."""
+    cancel_calls: list[str] = []
+
+    async def composite_run(_request):
+        return web.json_response({
+            "conversation_id": "conv-idem-3",
+            "workspace_id": "home-default",
+            "invocation_id": "inv-idem-3",
+            "status": "running",
+        }, status=202)
+
+    async def cancel_invocation(request):
+        cancel_calls.append(request.match_info["invocation_id"])
+        return web.json_response({"status": "cancelled"})
+
+    async def invocation_result(_request):
+        return web.json_response({"status": "completed", "blocks": [
+            {"role": "assistant", "block_type": "text", "content": "done"}
+        ]})
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_post("/api/invocations/{invocation_id}/cancel", cancel_invocation)
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    result = await runtime.run_turn(
+        message="finish fast",
+        session_key="session-idem-3",
+        hermes_session_id="h-idem-3",
+        workspace_id="home-default",
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+
+    # After turn is done, cancel must be a no-op
+    await runtime.cancel_session_async("session-idem-3")
+    await runtime.cancel_session_async("session-idem-3")
+
+    assert len(cancel_calls) == 0
+    assert runtime.active_invocation("session-idem-3") is None

@@ -10156,6 +10156,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check for commands
         command = event.get_command()
 
+        # ── /hermes umbrella expansion ──────────────────────────────────
+        # The Slack adapter (plugins/platforms/slack/adapter.py) expands
+        # ``/hermes <subcommand> [args]`` into a canonical slash command
+        # before it ever reaches the generic dispatcher.  On every other
+        # platform (Telegram, Discord, API, webhook, etc.) a plain
+        # MessageEvent(text="/hermes runtime ncoder") arrives here with
+        # command="hermes" — which is NOT in GATEWAY_KNOWN_COMMANDS and
+        # would be rejected as "Unknown command".  Expand it here so the
+        # umbrella works uniformly across all platform gateways.
+        #
+        # Mirrors the subcommand-to-command mapping from Slack's adapter.
+        # This runs BEFORE the canonical-resolution / alias-expansion block
+        # below so the expanded command flows through all normal dispatch
+        # (hooks, access control, Level-2 handlers).
+        if command == "hermes":
+            _hermes_args = event.get_command_args().strip()
+            if not _hermes_args:
+                # Bare /hermes with no subcommand → /help (mirrors Slack)
+                event.text = "/help"
+                command = event.get_command()
+            else:
+                from hermes_cli.commands import slack_subcommand_map
+
+                _hermes_map = slack_subcommand_map()
+                _hermes_map["compact"] = "/compress"  # Slack adapter also adds this
+                _hermes_parts = _hermes_args.split(maxsplit=1)
+                _first = _hermes_parts[0]
+                if _first in _hermes_map:
+                    # Rewrite: /hermes runtime ncoder → /runtime ncoder
+                    _target = _hermes_map[_first]
+                    _rest = _hermes_parts[1] if len(_hermes_parts) > 1 else ""
+                    event.text = f"{_target} {_rest}".strip()
+                    command = event.get_command()
+                else:
+                    # Free-form question after /hermes — strip prefix and
+                    # treat as regular text (mirrors Slack adapter behaviour).
+                    from gateway.platforms.base import MessageType
+                    event.text = _hermes_args
+                    event.message_type = MessageType.TEXT
+                    command = None
+
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
             is_gateway_known_command,
@@ -16965,25 +17006,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return
         running_agent = self._running_agents.get(session_key)
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            running_agent.interrupt(interrupt_reason)
-        # North foreground turns execute through a process-wide runtime adapter,
-        # while _running_agents still contains the Hermes host used by the
-        # Gateway lifecycle. Interrupt both boundaries: cancel_session is a
-        # no-op unless this exact session owns an active (or starting) North
-        # invocation, so native sessions retain their existing behavior.
-        try:
-            from gateway.north_coder_runtime import runtime_from_raw
+        # _interrupt_north_host interrupts both the Hermes host agent AND the
+        # North runtime in one call, avoiding the double interrupt that the
+        # previous inline running_agent.interrupt + runtime_from_raw /
+        # cancel_session_async sequence caused.  It handles None agent, missing
+        # runtime, and runtime_from_raw/load errors gracefully.
+        from gateway.north_coder_runtime import _interrupt_north_host
 
-            north_runtime = runtime_from_raw(
-                _load_gateway_config(), _gateway_config_home()
-            )
-            if north_runtime is not None:
-                await north_runtime.cancel_session_async(session_key)
-        except Exception:
-            logger.exception(
-                "Failed to cancel North invocation for session %s", session_key
-            )
+        await _interrupt_north_host(running_agent, session_key, interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
@@ -20431,7 +20461,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
-                            agent.interrupt(pending_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                agent, session_key, str(pending_text or "")
+                            )
                             _interrupt_detected.set()
                             break
                 except asyncio.CancelledError:
@@ -20618,7 +20652,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                _backup_agent, session_key, str(_bp_text or "")
+                            )
                             _interrupt_detected.set()
             else:
                 # Poll loop: check the agent's built-in activity tracker
@@ -20678,7 +20716,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                _backup_agent, session_key, str(_bp_text or "")
+                            )
                             _interrupt_detected.set()
 
             if _inactivity_timeout:
@@ -20708,7 +20750,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                    from gateway.north_coder_runtime import _interrupt_north_host
+
+                    await _interrupt_north_host(
+                        _timed_out_agent,
+                        session_key,
+                        str(_INTERRUPT_REASON_TIMEOUT),
+                    )
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 

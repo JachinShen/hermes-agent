@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -4219,13 +4219,16 @@ def _agent_cbs(sid: str) -> dict:
     }
 
 
-def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
+def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> bool:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
     desktop follows (refresh tree + scope into the project). This is the ONLY
-    auto-cwd path — driven by an explicit tool call, never a terminal `cd`."""
+    auto-cwd path — driven by an explicit tool call, never a terminal `cd`.
+
+    Returns True on success, False on any failure.
+    """
     if not path:
-        return
+        return False
 
     # The tool's task_id is the durable session_key, but _sessions is keyed by a
     # short sid uuid (and the desktop routes events by that sid). Resolve it.
@@ -4242,35 +4245,147 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
                     break
 
     if session is None:
-        return
+        return False
 
     resolved = os.path.abspath(os.path.expanduser(str(path)))
     if not os.path.isdir(resolved):
-        return
-
-    session["cwd"] = resolved
-    session["explicit_cwd"] = True
-    _register_session_cwd(session)
-
-    with _session_db(session) as db:
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist project workspace cwd", exc_info=True)
-
-    _persist_session_git_meta(session, resolved)
+        return False
 
     try:
-        agent = session.get("agent")
-        info = (
-            _session_info(agent, session)
-            if agent is not None
-            else {"cwd": resolved, "branch": _git_branch_for_cwd(resolved), "lazy": True}
-        )
-        _emit("session.info", sid, info)
+        session["cwd"] = resolved
+        session["explicit_cwd"] = True
+        _register_session_cwd(session)
+
+        with _session_db(session) as db:
+            if db is not None:
+                try:
+                    db.update_session_cwd(session.get("session_key", ""), resolved)
+                except Exception:
+                    logger.debug("failed to persist project workspace cwd", exc_info=True)
+
+        _persist_session_git_meta(session, resolved)
+
+        try:
+            agent = session.get("agent")
+            info = (
+                _session_info(agent, session)
+                if agent is not None
+                else {"cwd": resolved, "branch": _git_branch_for_cwd(resolved), "lazy": True}
+            )
+            _emit("session.info", sid, info)
+        except Exception:
+            logger.debug("failed to emit session.info after project workspace move", exc_info=True)
     except Exception:
-        logger.debug("failed to emit session.info after project workspace move", exc_info=True)
+        return False
+
+    return True
+
+
+def _make_north_workspace_switch_callback(
+    session_id: str,
+) -> Callable[[dict[str, Any]], Optional[str]]:
+    """Build a workspace_switch callback injected into North TUI agents.
+
+    The callback is invoked by ``NorthCoderTUIAgent.run_conversation`` after
+    a successful North turn that contains a ``project_switch`` tool result.
+
+    Order of operations:
+    1. Re-resolve the project by *project_id* from projects.db (canonical)
+    2. Verify the live session still exists (fail if not)
+    3. Set the project active in projects.db
+    4. Apply workspace cwd via _apply_project_workspace (reused)
+    5. If cwd application fails, rollback set_active to original
+    6. Only on full success, return None (detach proceeds)
+
+    Returns ``None`` on success, or an error string on failure.
+    """
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.projects_db import connect_closing
+
+    def callback(ws: dict[str, Any]) -> Optional[str]:
+        project_id = ws.get("project_id", "")
+        if not project_id:
+            return "workspace_switch missing project_id"
+
+        hermes_home = Path(_hermes_home)
+        db_path = hermes_home / "projects.db"
+
+        # Phase 1: Resolve project by id from projects.db (canonical source)
+        try:
+            if not db_path.is_file():
+                return f"no projects database at {db_path}"
+            with connect_closing() as conn:
+                project = pdb.get_project(conn, project_id)
+                if project is None:
+                    return f"project '{project_id}' not found in projects.db"
+        except Exception as exc:
+            return f"failed to resolve project '{project_id}': {exc}"
+
+        # Phase 2: Resolve canonical path from the project, not the tool result
+        primary_path = None
+        if getattr(project, "primary_path", None):
+            primary_path = project.primary_path
+        else:
+            for folder in getattr(project, "folders", []) or []:
+                if getattr(folder, "is_primary", False):
+                    primary_path = folder.path
+                    break
+            if not primary_path:
+                folders = getattr(project, "folders", []) or []
+                primary_path = str(folders[0].path) if folders else None
+
+        if not primary_path:
+            return f"project '{project_id}' has no primary path"
+
+        resolved = os.path.abspath(os.path.expanduser(str(primary_path)))
+        if not os.path.isdir(resolved):
+            return f"project path does not exist: {resolved}"
+
+        # Phase 3: Verify live session exists BEFORE any mutation
+        key = session_id
+        session = None
+        with _sessions_lock:
+            if key in _sessions:
+                session = _sessions[key]
+            else:
+                for _sid, cand in _sessions.items():
+                    if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
+                        session = cand
+                        break
+
+        if session is None:
+            return f"no active session found for '{session_id}'"
+
+        # Phase 4: Save original active for rollback, then set active in DB
+        old_active_id = None
+        try:
+            with connect_closing() as conn:
+                old_active_id = pdb.get_active_id(conn)
+                pdb.set_active(conn, project_id)
+        except Exception as exc:
+            return f"failed to set active project: {exc}"
+
+        # Phase 5: Apply workspace cwd via _apply_project_workspace
+        try:
+            # _apply_project_workspace returns True on success, False on failure
+            # (not a void call — must check the bool)
+            if not _apply_project_workspace(key, resolved):
+                raise RuntimeError("_apply_project_workspace returned False")
+        except Exception as exc:
+            # Rollback: restore original active (or clear if was None)
+            try:
+                with connect_closing() as conn:
+                    pdb.set_active(conn, old_active_id)
+            except Exception as rollback_exc:
+                logger.error(
+                    "Failed to rollback project active after cwd error: %s",
+                    rollback_exc,
+                )
+            return f"failed to apply project workspace: {exc}"
+
+        return None
+
+    return callback
 
 
 def _wire_callbacks(sid: str):
@@ -4847,6 +4962,9 @@ def _make_agent(
             north_agent = tui_agent_from_raw(
                 cfg, Path(_hermes_home), session_id or key,
                 _review_host_factory=_make_review_host,
+                workspace_switch_callback=_make_north_workspace_switch_callback(
+                    session_id or key,
+                ),
             )
             if north_agent is not None:
                 north_agent.runtime_override = runtime_override or "ncoder"

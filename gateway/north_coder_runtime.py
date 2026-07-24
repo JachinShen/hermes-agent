@@ -17,12 +17,46 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, cast
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 DeltaCallback = Callable[[str], None]
+
+
+async def _interrupt_north_host(
+    host_agent: Any,
+    session_key: str,
+    interrupt_reason: str = "",
+) -> None:
+    """Interrupt both the Hermes host agent and the North runtime for session_key.
+
+    Gateway's interrupt paths (monitor_for_interrupt, backup checks, inactivity
+    timeout) all reach a running Hermes agent first, but a North Coder foreground
+    turn also owns a process-wide runtime invocation that the host agent's
+    ``interrupt()`` does not touch.  This helper bridges the gap so all paths
+    consistently cancel both boundaries.
+
+    ``host_agent`` may be ``None`` (no Hermes host running); only the North
+    runtime is cancelled in that case.  ``runtime_from_raw`` failures are
+    caught and logged, never propagated.
+    """
+    if host_agent is not None and hasattr(host_agent, "interrupt"):
+        host_agent.interrupt(interrupt_reason)
+    try:
+        from gateway.run import _gateway_config_home, _load_gateway_config
+
+        _runtime = runtime_from_raw(
+            _load_gateway_config(),
+            _gateway_config_home(),
+        )
+        if _runtime is not None:
+            await _runtime.cancel_session_async(session_key)
+    except Exception:
+        logger.exception(
+            "Failed to cancel North invocation for session %s", session_key
+        )
 
 
 @dataclass(frozen=True)
@@ -34,6 +68,9 @@ class NorthCoderRuntimeConfig:
     model_id: Optional[str] = "ng-gpt-5.6-sol"
     timeout_seconds: float = 1800.0
     state_file: Optional[str] = None
+    seed_token_budget: int = 2000
+    tui_variant: bool = False
+    workspace_switch_supported: bool = False
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> Optional["NorthCoderRuntimeConfig"]:
@@ -54,6 +91,7 @@ class NorthCoderRuntimeConfig:
             model_id=(str(section["model_id"]) if section.get("model_id") else None),
             timeout_seconds=float(section.get("timeout_seconds") or cls.timeout_seconds),
             state_file=(str(section["state_file"]) if section.get("state_file") else None),
+            seed_token_budget=int(section.get("seed_token_budget") or cls.seed_token_budget),
         )
 
 
@@ -69,6 +107,10 @@ class NorthCoderRuntime:
         self._active_invocations: dict[str, str] = {}
         self._inflight_sessions: set[str] = set()
         self._cancel_requested_sessions: set[str] = set()
+        # Idempotent-cancel guard: invocation_ids for which we have already
+        # POSTed a cancel request.  Prevents duplicate POSTs from repeated
+        # cancel_session_async calls for the same in-flight invocation.
+        self._cancel_posted: set[str] = set()
         self._active_lock = threading.RLock()
 
     async def run_turn(
@@ -110,7 +152,9 @@ class NorthCoderRuntime:
             )
         finally:
             with self._active_lock:
-                self._active_invocations.pop(session_key, None)
+                old_inv = self._active_invocations.pop(session_key, None)
+                if old_inv:
+                    self._cancel_posted.discard(old_inv)
                 self._inflight_sessions.discard(session_key)
                 self._cancel_requested_sessions.discard(session_key)
 
@@ -172,7 +216,7 @@ class NorthCoderRuntime:
         headers = {"Content-Type": "application/json", "X-Hermes-Session-Id": hermes_session_id}
         client_message_id = event_message_id or f"hermes-{uuid.uuid4().hex}"
         payload = {
-            "content": self._seeded_message(message, conversation_history) if created else message,
+            "content": self._seeded_message(message, conversation_history, self.config.seed_token_budget) if created else message,
             "client_message_id": client_message_id,
             "agent_profile_id": self.config.agent_profile_id,
             "metadata": {
@@ -261,7 +305,10 @@ class NorthCoderRuntime:
                     with self._active_lock:
                         self._active_invocations[session_key] = str(invocation_id)
                         cancel_requested = session_key in self._cancel_requested_sessions
-                    if cancel_requested:
+                        already_posted = str(invocation_id) in self._cancel_posted
+                    if cancel_requested and not already_posted:
+                        with self._active_lock:
+                            self._cancel_posted.add(str(invocation_id))
                         await self.cancel(str(invocation_id))
 
             if composite_run:
@@ -284,7 +331,11 @@ class NorthCoderRuntime:
                 # WebSocket run_finished is progress only; the REST invocation
                 # status is authoritative because a finished run may pause in
                 # requires_action.
+                # When the WebSocket errored (transport_error), partial deltas
+                # from the failed stream are replaced by the REST full text.
                 if invocation_id:
+                    if terminal.get("transport_error"):
+                        full_response.clear()
                     try:
                         authoritative = await self._poll_result(client, invocation_id, full_response, on_event)
                     except Exception as exc:
@@ -295,6 +346,11 @@ class NorthCoderRuntime:
                         if authoritative.get("required_action"):
                             terminal["required_action"] = authoritative["required_action"]
                         terminal["result"] = authoritative
+                elif terminal.get("transport_error"):
+                    # WebSocket errored and there is no invocation to poll.
+                    # Return a structured failed state instead of fake completed.
+                    terminal["status"] = "failed"
+                    terminal.setdefault("error", terminal["transport_error"])
             elif invocation_id:
                 terminal = await self._poll_result(client, invocation_id, full_response, on_event)
 
@@ -338,6 +394,34 @@ class NorthCoderRuntime:
                     status = "completed"
                     break
         requires_action = status == "requires_action"
+        # Gateway direct path (workspace_switch_supported=False): detect and
+        # reject workspace_switch intents with a structured unsupported response.
+        if not self.config.workspace_switch_supported:
+            ws = self.extract_workspace_switch(terminal)
+            if ws is not None:
+                logger.warning(
+                    "Workspace switch intent detected in Gateway direct runtime "
+                    "for session %s — workspace_switch_supported=False; rejected",
+                    session_key,
+                )
+                return {
+                    "final_response": (
+                        "Project switch is not supported in this runtime mode. "
+                        "Use the terminal or a North TUI session to switch projects."
+                    ),
+                    "messages": [{"role": "user", "content": message}, {"role": "assistant", "content": ""}],
+                    "api_calls": 1,
+                    "tools": terminal.get("tools", []),
+                    "completed": False,
+                    "interrupted": False,
+                    "failed": True,
+                    "status": "unsupported",
+                    "session_id": hermes_session_id,
+                    "north_conversation_id": conversation_id,
+                    "north_invocation_id": invocation_id,
+                    "history_offset": 0,
+                    "response_previewed": False,
+                }
         return {
             "final_response": text or ("⏸️ North Coder is waiting for user action." if requires_action else "(No response from North Coder)"),
             "messages": [{"role": "user", "content": message}, {"role": "assistant", "content": text}],
@@ -355,6 +439,80 @@ class NorthCoderRuntime:
             "history_offset": 0,
             "response_previewed": bool(on_delta and text),
         }
+
+    def extract_workspace_switch(self, terminal: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Extract a workspace_switch intent from tool events in the result.
+
+        Correlates tool_call_start events (carrying the tool name) with
+        tool_call_result events (carrying the result content) by tool call id.
+        Returns the parsed ``workspace_switch`` dict on success, or None on
+        any validation failure.
+
+        Rejection rules (must all pass):
+          - Tool name must be ``project_switch``
+          - Result must not have ``isError`` set
+          - Content must be valid JSON
+          - JSON must have ``success: true`` and ``workspace_switch`` key
+          - ``workspace_switch.path`` must be absolute and exist on disk
+        """
+        tools = terminal.get("tools") or []
+        if not tools:
+            return None
+
+        # Phase 1: collect tool call name mappings by id
+        tool_names: dict[str, str] = {}
+        for event in tools:
+            if not isinstance(event, dict):
+                continue
+            kind = str(event.get("type") or "")
+            call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+            if not call_id:
+                continue
+            if kind == "tool_call_start":
+                name = str(event.get("toolCallName") or event.get("tool_name") or "")
+                if name:
+                    tool_names[call_id] = name
+
+        # Phase 2: inspect results
+        for event in tools:
+            if not isinstance(event, dict):
+                continue
+            kind = str(event.get("type") or "")
+            if kind not in {"tool_call_result", "tool_call_end"}:
+                continue
+            if event.get("isError"):
+                continue
+            call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+            tool_name = tool_names.get(call_id) or str(event.get("toolCallName") or event.get("tool_name") or "")
+            if tool_name != "project_switch":
+                continue
+            content = event.get("content") or event.get("result")
+            if not isinstance(content, str) or not content:
+                continue
+            try:
+                data = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if not data.get("success"):
+                continue
+            ws = data.get("workspace_switch")
+            if not isinstance(ws, dict):
+                continue
+            path = ws.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            if not os.path.isabs(path):
+                continue
+            if not Path(path).expanduser().resolve().is_dir():
+                continue
+            return {
+                "project_id": str(ws.get("project_id", "")),
+                "project_name": str(ws.get("project_name", "")),
+                "path": str(Path(path).expanduser().resolve()),
+            }
+        return None
 
     async def cancel(self, invocation_id: str) -> None:
         import aiohttp
@@ -377,16 +535,31 @@ class NorthCoderRuntime:
             return invocation_id
 
     async def cancel_session_async(self, session_key: str) -> None:
-        """Cancel a North turn from an async Gateway command handler."""
+        """Cancel a North turn from an async Gateway command handler.
+
+        Idempotent: at most one POST per invocation_id, even when called
+        repeatedly for the same in-flight turn.
+        """
         invocation_id = self._request_session_cancel(session_key)
         if invocation_id:
+            with self._active_lock:
+                if invocation_id in self._cancel_posted:
+                    return
+                self._cancel_posted.add(invocation_id)
             await self.cancel(invocation_id)
 
     def cancel_session(self, session_key: str) -> None:
-        """Best-effort synchronous cancellation hook for Gateway/TUI threads."""
+        """Best-effort synchronous cancellation hook for Gateway/TUI threads.
+
+        Idempotent: at most one POST per invocation_id.
+        """
         invocation_id = self._request_session_cancel(session_key)
         if not invocation_id:
             return
+        with self._active_lock:
+            if invocation_id in self._cancel_posted:
+                return
+            self._cancel_posted.add(invocation_id)
         try:
             asyncio.run(self.cancel(invocation_id))
         except Exception:
@@ -539,7 +712,12 @@ class NorthCoderRuntime:
             if item.type.name in {"CLOSED", "CLOSE", "CLOSING"}:
                 break
             if item.type.name == "ERROR":
-                raise RuntimeError(f"North event stream error: {ws.exception()}")
+                logger.warning(
+                    "North event stream error for session; falling back to REST polling: %s",
+                    ws.exception(),
+                )
+                terminal["transport_error"] = str(ws.exception() or "North event stream error")
+                break
             if item.type.name != "TEXT":
                 continue
             event = json.loads(item.data)
@@ -718,18 +896,35 @@ class NorthCoderRuntime:
     def _seeded_message(
         message: str,
         conversation_history: Optional[list[dict[str, Any]]],
+        seed_token_budget: int = 2000,
     ) -> str:
-        """Project the canonical Gateway transcript into a fresh provider lane."""
+        """Project the canonical Gateway transcript into a fresh provider lane.
+
+        Only called for fresh conversations (created=True). From back to
+        front, retains the most recent user/assistant pairs up to
+        seed_token_budget. Uses rough estimate (len+3)//4 ≈ 4 chars/token.
+        Never returns empty — at minimum the current message is preserved.
+        """
         if not conversation_history:
             return message
         projected: list[tuple[str, str]] = []
-        for item in conversation_history:
+        budget = seed_token_budget
+        for item in reversed(conversation_history):
             role = str(item.get("role") or "")
             if role not in {"user", "assistant"}:
                 continue
             content = item.get("content")
-            if isinstance(content, str) and content:
-                projected.append((role, content))
+            if not isinstance(content, str) or not content:
+                continue
+            entry_text = f"{role}:\n{content}"
+            tok = (len(entry_text) + 3) // 4
+            if tok > budget:
+                if not projected:
+                    projected.append((role, content[:budget * 4]))
+                break
+            budget -= tok
+            projected.append((role, content))
+        projected.reverse()
         if not projected:
             return message
         history_text = "\n\n".join(
@@ -742,22 +937,43 @@ class NorthCoderRuntime:
             f"{message}"
         )
 
-    def _refresh_managed_profile(self) -> None:
+    def _refresh_managed_profile(self) -> Optional[Path]:
         """Refresh the generated Hermes artifact at a new-conversation boundary.
 
         Only the canonical profile path under this Hermes home is managed. An
         arbitrary user-supplied North ``agent_yaml_path`` is never overwritten.
+
+        When ``tui_variant`` is True, writes ``agent-tui.yaml`` (with project
+        switch tools).  Otherwise writes ``agent.yaml`` (Gateway direct path).
+
+        Returns the path to the generated YAML, or None if the profile is not
+        managed (user-specified path).
         """
         if not self.config.agent_yaml_path:
-            return
+            return None
         configured = Path(self.config.agent_yaml_path).expanduser().resolve()
-        managed = (self.hermes_home / "north-coder-profile" / "agent.yaml").resolve()
-        if configured != managed:
-            return
+        managed_dir = self.hermes_home / "north-coder-profile"
+        managed = (managed_dir / "agent.yaml").resolve()
+
+        # Non-managed agent_yaml_path: fail closed — don't inject project tools
+        # or fake a variant that wasn't configured.
+        if configured == managed and not self.config.tui_variant:
+            pass  # normal managed path, write agent.yaml
+        elif configured == (managed_dir / "agent-tui.yaml").resolve() and self.config.tui_variant:
+            pass  # TUI managed path, write agent-tui.yaml
+        else:
+            # User explicitly configured a non-managed path — do not overwrite.
+            if not str(configured).startswith(str(managed_dir.resolve())):
+                return None
+
         from hermes_cli.north_coder_profile import export_hermes_profile
 
         profile_name = self.config.agent_profile_id.replace(":", "-") or "hermes-default"
-        export_hermes_profile(self.hermes_home, managed.parent, name=profile_name)
+        export_hermes_profile(
+            self.hermes_home, managed_dir, name=profile_name,
+            tui_variant=self.config.tui_variant,
+        )
+        return Path(str(self.config.agent_yaml_path))
 
     async def _create_conversation(self, session_key: str) -> str:
         import aiohttp
@@ -800,8 +1016,6 @@ class NorthCoderRuntime:
         os.replace(temp, self.state_file)
 
 
-
-
 _RUNTIME_CACHE: dict[tuple[str, str, str], "NorthCoderRuntime"] = {}
 
 
@@ -822,11 +1036,30 @@ class NorthCoderTUIAgent:
 
     The TUI invokes ``run_conversation`` synchronously from its worker thread;
     the external runtime remains async and owns the real conversation state.
+
+    The TUI variant enables workspace switch support and uses agent-tui.yaml.
     """
 
     def __init__(self, runtime: NorthCoderRuntime, session_key: str,
-                 _review_host_factory=None):
+                 _review_host_factory=None, workspace_switch_callback=None):
+        import dataclasses
+        # TUI explicitly supports workspace switching and uses the TUI variant
         self.runtime = runtime
+        # Patch the runtime config to use tui_variant and workspace_switch_supported
+        if not runtime.config.tui_variant or not runtime.config.workspace_switch_supported:
+            self.runtime = NorthCoderRuntime(
+                dataclasses.replace(
+                    runtime.config,
+                    tui_variant=True,
+                    workspace_switch_supported=True,
+                    agent_yaml_path=str(runtime.hermes_home / "north-coder-profile" / "agent-tui.yaml") if (
+                        runtime.config.agent_yaml_path is None
+                        or str(Path(runtime.config.agent_yaml_path).expanduser().resolve())
+                        == str((runtime.hermes_home / "north-coder-profile" / "agent.yaml").resolve())
+                    ) else runtime.config.agent_yaml_path,
+                ),
+                runtime.hermes_home,
+            )
         self.session_key = session_key
         self.session_id = session_key
         self.model = "north-coder"
@@ -835,6 +1068,14 @@ class NorthCoderTUIAgent:
         self.history: list[dict[str, Any]] = []
         self._last_invocation_id: Optional[str] = None
         self._interrupted = False
+        # workspace_switch_callback is a callable that receives the extracted
+        # workspace_switch dict and returns None on success or an error string
+        # on failure.  Set by _make_agent in tui_gateway/server.py for North
+        # TUI sessions; None in Gateway direct-runtime paths.
+        self._workspace_switch_callback = workspace_switch_callback
+        # Cache the last extracted workspace_switch so run_conversation can
+        # apply it after the turn completes but before background review.
+        self._pending_workspace_switch: Optional[dict[str, Any]] = None
         # Lazy factory for the Hermes AIAgent review host.  Only invoked when
         # nudge thresholds are met — never per-turn — to avoid building a
         # second runtime on every North foreground turn.
@@ -899,6 +1140,48 @@ class NorthCoderTUIAgent:
         # so return the facade's full history instead of letting the server
         # overwrite prior turns with the latest pair.
         result["messages"] = list(self.history)
+
+        # ── Workspace switch intent handling ─────────────────────────────
+        # Extract workspace_switch from tool results before background review.
+        # Callback is injected by _make_agent in tui_gateway/server.py for
+        # North TUI sessions; None in Gateway direct-runtime paths.
+        self._pending_workspace_switch = self.runtime.extract_workspace_switch(result)
+        if self._pending_workspace_switch and self._workspace_switch_callback:
+            cb_error = self._workspace_switch_callback(self._pending_workspace_switch)
+            if cb_error is None:
+                # Callback succeeded: detach old North binding so the next turn
+                # creates a new North conversation with the correct workdir.
+                self.runtime.detach_session(self.session_key)
+                self._pending_workspace_switch = None
+            else:
+                # Callback failed: keep old binding, mark turn as failed.
+                error_msg = str(cb_error)
+                result["completed"] = False
+                result["failed"] = True
+                result["status"] = "failed"
+                result["final_response"] = (
+                    f"⚠️ Project switch blocked: {error_msg}\n\n"
+                    "The workspace switch could not be applied. "
+                    "Your session remains in the previous context."
+                )
+                logger.warning(
+                    "Workspace switch callback failed for session %s: %s",
+                    self.session_key, error_msg,
+                )
+        elif self._pending_workspace_switch and not self._workspace_switch_callback:
+            # Gateway direct-runtime path (no callback): reject as unsupported.
+            logger.warning(
+                "Project_switch intent detected in Gateway direct runtime "
+                "for session %s — no workspace_switch_callback configured; rejected",
+                self.session_key,
+            )
+            result["failed"] = True
+            result["status"] = "unsupported"
+            result["final_response"] = (
+                "⚠️ Project switch is not supported in this runtime mode. "
+                "Use the terminal or a North TUI session to switch projects."
+            )
+
         # Schedule background memory/skill review after a successful turn.
         # This runs as a Hermes sidecar — it does NOT create a North background
         # conversation.  The canonical transcript (self.history) MUST include
@@ -963,15 +1246,17 @@ class NorthCoderTUIAgent:
             logger.warning("North background review scheduling failed", exc_info=True)
 
 
-
 def tui_agent_from_raw(
     raw: dict[str, Any],
     hermes_home: Path,
     session_key: str,
     _review_host_factory=None,
+    workspace_switch_callback=None,
 ) -> Optional[NorthCoderTUIAgent]:
     runtime = runtime_from_raw(raw, hermes_home)
-    return NorthCoderTUIAgent(runtime, session_key, _review_host_factory=_review_host_factory) if runtime else None
+    return NorthCoderTUIAgent(runtime, session_key,
+                              _review_host_factory=_review_host_factory,
+                              workspace_switch_callback=workspace_switch_callback) if runtime else None
 
 
 # ---------------------------------------------------------------------------
