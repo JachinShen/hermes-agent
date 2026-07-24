@@ -2328,6 +2328,23 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+
+def _north_provider_current_turn(event: Any, source: Any) -> tuple[str, dict[str, Any]]:
+    """Return the unadorned user turn plus structured platform context.
+
+    Gateway's native model-facing message may contain sender attribution,
+    reply pointers, channel backfill, attachment notes, or timestamps. North
+    owns its own conversation UI, so persisting those annotations as the
+    current user instruction produces misleading turns. Keep the platform text
+    exact and carry attribution separately.
+    """
+    return str(getattr(event, "text", "") or ""), {
+        "hermes_sender_name": getattr(source, "user_name", None),
+        "hermes_reply_to_message_id": getattr(event, "reply_to_message_id", None),
+        "hermes_reply_to_text": getattr(event, "reply_to_text", None),
+    }
+
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -12213,6 +12230,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            # Preserve the platform user's actual turn separately from the
+            # model-facing message. _prepare_inbound_message_text enriches the
+            # latter with sender/reply/channel context for Hermes native, but an
+            # external conversation runtime must not persist those display
+            # annotations as the user's current instruction.
+            provider_user_message, provider_message_metadata = (
+                _north_provider_current_turn(event, source)
+            )
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -12243,6 +12268,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -17755,6 +17782,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        provider_user_message: Optional[str] = None,
+        provider_message_metadata: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -17773,6 +17802,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -17784,6 +17815,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -17905,6 +17938,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        provider_user_message: Optional[str] = None,
+        provider_message_metadata: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19891,7 +19926,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 args=_event,
                             )
                     result = asyncio.run(_north_runtime.run_turn(
-                        message=_api_run_message if isinstance(_api_run_message, str) else message,
+                        message=(
+                            provider_user_message
+                            if provider_user_message is not None
+                            else (_api_run_message if isinstance(_api_run_message, str) else message)
+                        ),
                         session_key=session_key or session_id,
                         hermes_session_id=session_id,
                         context_prompt=combined_ephemeral,
@@ -19906,6 +19945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event_message_id=event_message_id,
                         on_delta=_stream_delta_cb,
                         on_event=_north_event_sync,
+                        metadata_extra=provider_message_metadata,
                     ))
                 else:
                     result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
@@ -21029,6 +21069,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    provider_user_message=(
+                        _north_provider_current_turn(pending_event, next_source)[0]
+                        if pending_event is not None
+                        else pending
+                    ),
+                    provider_message_metadata=(
+                        _north_provider_current_turn(pending_event, next_source)[1]
+                        if pending_event is not None
+                        else None
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

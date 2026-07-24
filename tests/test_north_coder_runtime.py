@@ -3,13 +3,35 @@ import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from aiohttp import web
 
 from gateway.north_coder_runtime import NorthCoderRuntime, NorthCoderRuntimeConfig, NorthCoderTUIAgent
+from gateway.run import _north_provider_current_turn
 from hermes_cli.north_coder_profile import export_hermes_profile
+
+
+def test_north_current_turn_keeps_reply_and_sender_out_of_user_instruction():
+    event = SimpleNamespace(
+        text="你有多少个 skill",
+        reply_to_message_id="171234.0001",
+        reply_to_text="你在什么 runtime？",
+    )
+    source = SimpleNamespace(user_name="Jachin Shen")
+
+    message, metadata = _north_provider_current_turn(event, source)
+
+    assert message == "你有多少个 skill"
+    assert "Replying to" not in message
+    assert "Jachin Shen" not in message
+    assert metadata == {
+        "hermes_sender_name": "Jachin Shen",
+        "hermes_reply_to_message_id": "171234.0001",
+        "hermes_reply_to_text": "你在什么 runtime？",
+    }
 
 
 def test_generated_memory_bridge_writes_both_hermes_targets(tmp_path):
