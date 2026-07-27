@@ -276,40 +276,69 @@ class NorthCoderRuntime:
                 request_url = f"{self.config.base_url}/api/conversations/{conversation_id}/messages"
                 request_payload = payload
 
-            async with client.post(request_url, json=request_payload) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    operation = "run" if composite_run else "message"
-                    raise RuntimeError(f"North {operation} request failed ({response.status}): {body[:500]}")
-                accepted = json.loads(body) if body else {}
-                if composite_run:
-                    conversation_id = str(accepted.get("conversation_id") or "")
-                    if not conversation_id:
-                        raise RuntimeError("North composite run response omitted conversation_id")
-                    workspace_id = str(accepted.get("workspace_id") or "")
-                    if not workspace_id:
-                        raise RuntimeError("North composite run response omitted workspace_id")
-                    if requested_workspace_id and workspace_id != requested_workspace_id:
-                        raise RuntimeError(
-                            "North composite run response returned unexpected workspace_id "
-                            f"{workspace_id!r}; expected {requested_workspace_id!r}"
-                        )
-                    await self._record_conversation_binding(
-                        session_key,
-                        conversation_id,
-                        str(effective_workdir) if effective_workdir else None,
-                        workspace_id,
+            registration_degraded_to_workdir = False
+
+            async def _post_request(request_body: dict[str, Any]) -> tuple[int, str]:
+                async with client.post(request_url, json=request_body) as response:
+                    return response.status, await response.text()
+
+            response_status, body = await _post_request(request_payload)
+            if (
+                response_status >= 400
+                and composite_run
+                and effective_workdir
+                and request_payload.get("register_workdir") is True
+                and self._is_workdir_register_failed(response_status, body)
+            ):
+                # North 0.4 does not discover detached-HEAD linked worktrees because
+                # its porcelain parser only registers entries carrying `branch`.
+                # `workdir_register_failed` is emitted before invocation creation,
+                # so retrying workspace-less cannot duplicate agent side effects.
+                degraded_payload = dict(request_payload)
+                degraded_payload.pop("register_workdir", None)
+                logger.warning(
+                    "North could not register workdir %s as a sidebar workspace; "
+                    "retrying with an exact workspace-less workdir binding",
+                    effective_workdir,
+                )
+                response_status, body = await _post_request(degraded_payload)
+                registration_degraded_to_workdir = True
+
+            if response_status >= 400:
+                operation = "run" if composite_run else "message"
+                raise RuntimeError(
+                    f"North {operation} request failed ({response_status}): {body[:500]}"
+                )
+            accepted = json.loads(body) if body else {}
+            if composite_run:
+                conversation_id = str(accepted.get("conversation_id") or "")
+                if not conversation_id:
+                    raise RuntimeError("North composite run response omitted conversation_id")
+                workspace_id = str(accepted.get("workspace_id") or "")
+                if not workspace_id and not registration_degraded_to_workdir:
+                    raise RuntimeError("North composite run response omitted workspace_id")
+                if requested_workspace_id and workspace_id != requested_workspace_id:
+                    raise RuntimeError(
+                        "North composite run response returned unexpected workspace_id "
+                        f"{workspace_id!r}; expected {requested_workspace_id!r}"
                     )
-                invocation_id = accepted.get("invocation_id")
-                if invocation_id:
+                await self._record_conversation_binding(
+                    session_key,
+                    conversation_id,
+                    str(effective_workdir) if effective_workdir else None,
+                    workspace_id or None,
+                    workdir_only=registration_degraded_to_workdir,
+                )
+            invocation_id = accepted.get("invocation_id")
+            if invocation_id:
+                with self._active_lock:
+                    self._active_invocations[session_key] = str(invocation_id)
+                    cancel_requested = session_key in self._cancel_requested_sessions
+                    already_posted = str(invocation_id) in self._cancel_posted
+                if cancel_requested and not already_posted:
                     with self._active_lock:
-                        self._active_invocations[session_key] = str(invocation_id)
-                        cancel_requested = session_key in self._cancel_requested_sessions
-                        already_posted = str(invocation_id) in self._cancel_posted
-                    if cancel_requested and not already_posted:
-                        with self._active_lock:
-                            self._cancel_posted.add(str(invocation_id))
-                        await self.cancel(str(invocation_id))
+                        self._cancel_posted.add(str(invocation_id))
+                    await self.cancel(str(invocation_id))
 
             if composite_run:
                 try:
@@ -325,6 +354,7 @@ class NorthCoderRuntime:
                         on_delta,
                         on_event,
                         process_replay=composite_run,
+                        stream_text=not bool(invocation_id and self.config.tui_variant),
                     )
                 )
                 if invocation_id:
@@ -854,6 +884,7 @@ class NorthCoderRuntime:
         on_event: Optional[EventCallback],
         *,
         process_replay: bool = False,
+        stream_text: bool = True,
     ) -> dict[str, Any]:
         replaying = False
         terminal: dict[str, Any] = {"status": "completed", "tools": []}
@@ -894,7 +925,7 @@ class NorthCoderRuntime:
                     await result
             if (replaying and not process_replay) or kind in {"history_ref", "replay_start", "replay_end"}:
                 continue
-            if kind == "text_message_content":
+            if kind == "text_message_content" and stream_text:
                 delta = str(event.get("delta") or "")
                 if delta:
                     full_response.append(delta)
@@ -976,8 +1007,112 @@ class NorthCoderRuntime:
                 parts.append(content)
         return "".join(parts)
 
+    @staticmethod
+    def _extract_final_result_text(result: dict[str, Any]) -> str:
+        """Return only the terminal assistant block, excluding process narration."""
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return NorthCoderRuntime._extract_result_text(result)
+        for index in range(len(blocks) - 1, -1, -1):
+            block = blocks[index]
+            if not isinstance(block, dict):
+                continue
+            role = str(block.get("role") or "")
+            block_type = str(block.get("block_type") or block.get("type") or "")
+            if role != "assistant" or block_type != "text":
+                continue
+            # A text block followed by another assistant action is progress
+            # narration, not the terminal answer.
+            has_later_action = any(
+                isinstance(later, dict)
+                and str(later.get("role") or "") == "assistant"
+                and str(later.get("block_type") or later.get("type") or "")
+                in {"text", "tool_use", "tool_result", "background_task"}
+                for later in blocks[index + 1 :]
+            )
+            if not has_later_action:
+                content = block.get("content") or block.get("text")
+                return content if isinstance(content, str) else ""
+        return ""
+
+    async def _emit_rest_process_events(
+        self,
+        result: dict[str, Any],
+        on_event: Optional[EventCallback],
+        seen: set[tuple[str, str]],
+    ) -> None:
+        """Map newly persisted North blocks onto Hermes process/tool events."""
+        if on_event is None:
+            return
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+            role = str(block.get("role") or "")
+            block_type = str(block.get("block_type") or block.get("type") or "")
+            position = str(block.get("position") if block.get("position") is not None else index)
+            key = (position, block_type)
+            if key in seen or role != "assistant":
+                continue
+
+            event: Optional[dict[str, Any]] = None
+            content = block.get("content") or block.get("text") or ""
+            if block_type == "text" and isinstance(content, str) and content:
+                has_later_action = any(
+                    isinstance(later, dict)
+                    and str(later.get("role") or "") == "assistant"
+                    and str(later.get("block_type") or later.get("type") or "")
+                    in {"text", "tool_use", "tool_result", "background_task"}
+                    for later in blocks[index + 1 :]
+                )
+                if has_later_action:
+                    event = {"type": "assistant_process", "text": content, "position": position}
+            elif block_type == "tool_use":
+                payload = block
+                if isinstance(content, str):
+                    try:
+                        parsed = json.loads(content)
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                event = {
+                    "type": "tool_call_start",
+                    "toolCallId": str(payload.get("id") or payload.get("tool_call_id") or position),
+                    "toolCallName": payload.get("name") or payload.get("tool_name"),
+                    "input": payload.get("input") or payload.get("args") or {},
+                }
+            elif block_type == "tool_result":
+                payload = block
+                if isinstance(content, str):
+                    try:
+                        parsed = json.loads(content)
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                event = {
+                    "type": "tool_call_result",
+                    "toolCallId": str(
+                        payload.get("toolUseId")
+                        or payload.get("tool_call_id")
+                        or position
+                    ),
+                    "content": payload.get("content") or payload.get("result") or "",
+                    "isError": bool(payload.get("isError") or payload.get("is_error")),
+                }
+            if event is None:
+                continue
+            seen.add(key)
+            callback_result = on_event(event)
+            if asyncio.iscoroutine(callback_result):
+                await callback_result
+
     async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback], *, on_delta: Optional[DeltaCallback] = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.timeout_seconds
+        seen_process_events: set[tuple[str, str]] = set()
         while time.monotonic() < deadline:
             async with client.get(f"{self.config.base_url}/api/invocations/{invocation_id}/result") as response:
                 if response.status >= 400:
@@ -988,8 +1123,18 @@ class NorthCoderRuntime:
                 callback_result = on_event(event)
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
-            text = self._extract_result_text(result)
-            if text:
+            if self.config.tui_variant:
+                await self._emit_rest_process_events(result, on_event, seen_process_events)
+            text = (
+                self._extract_final_result_text(result)
+                if self.config.tui_variant
+                else self._extract_result_text(result)
+            )
+            status = str(result.get("status") or "")
+            terminal_status = status in {
+                "completed", "requires_action", "failed", "cancelled", "error"
+            } or bool(result.get("finished"))
+            if text and (terminal_status or not self.config.tui_variant):
                 # Incremental delta: only append new suffix not yet in full_response
                 current = "".join(full_response)
                 if not current.startswith(text) and not text.startswith(current):
@@ -1005,7 +1150,6 @@ class NorthCoderRuntime:
                         full_response.append(suffix)
                         if on_delta:
                             on_delta(suffix)
-            status = str(result.get("status") or "")
             required_action = result.get("required_action")
             if isinstance(required_action, dict) and required_action.get("type") == "ask_user":
                 questions = self._extract_ask_user_questions(result)
@@ -1024,6 +1168,20 @@ class NorthCoderRuntime:
         return conversation_id
 
     @staticmethod
+    def _is_workdir_register_failed(status: int, body: str) -> bool:
+        """Recognize North's pre-invocation workdir registration failure."""
+        if status != 500:
+            return False
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        detail = payload.get("detail")
+        return isinstance(detail, dict) and detail.get("code") == "workdir_register_failed"
+
+    @staticmethod
     def _decode_binding(
         value: Any,
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1033,6 +1191,8 @@ class NorthCoderRuntime:
             conversation_id = str(value.get("conversation_id") or "")
             workdir = str(value.get("workdir") or "")
             workspace_id = str(value.get("workspace_id") or "")
+            if value.get("workdir_only") is True:
+                workspace_id = "__hermes_workdir_only__"
             return conversation_id or None, workdir or None, workspace_id or None
         return None, None, None
 
@@ -1048,15 +1208,20 @@ class NorthCoderRuntime:
         session_key: str,
         conversation_id: str,
         workdir: Optional[str],
-        workspace_id: str,
+        workspace_id: Optional[str],
+        *,
+        workdir_only: bool = False,
     ) -> None:
         with self._state_lock:
             state = self._read_state()
-            state[session_key] = {
+            binding = {
                 "conversation_id": conversation_id,
                 "workdir": workdir,
                 "workspace_id": workspace_id,
             }
+            if workdir_only:
+                binding["workdir_only"] = True
+            state[session_key] = binding
             self._write_state(state)
 
     async def _conversation_for_turn(self, session_key: str) -> tuple[str, bool]:
@@ -1257,6 +1422,9 @@ class NorthCoderTUIAgent:
         self.model = "north-coder"
         self.provider = "north_coder"
         self.runtime_override = "ncoder"
+        # Native AIAgent persists its own transcript.  North does not, so the
+        # TUI gateway must append this facade's canonical messages to SessionDB.
+        self.gateway_managed_history_persistence = True
         self.history: list[dict[str, Any]] = []
         self._last_invocation_id: Optional[str] = None
         self._interrupted = False
@@ -1278,7 +1446,8 @@ class NorthCoderTUIAgent:
 
     def run_conversation(self, message: Any, *, conversation_history=None, stream_callback=None,
                          tool_start_callback=None, tool_complete_callback=None,
-                         tool_progress_callback=None, task_id=None, **kwargs):
+                         tool_progress_callback=None, reasoning_callback=None,
+                         task_id=None, **kwargs):
         text = message if isinstance(message, str) else str(message)
         if conversation_history:
             self.history = list(conversation_history)
@@ -1286,9 +1455,14 @@ class NorthCoderTUIAgent:
         tool_names: dict[str, Any] = {}
 
         def on_event(event: dict[str, Any]) -> None:
+            kind = str(event.get("type") or "")
+            if kind == "assistant_process":
+                process_text = str(event.get("text") or "")
+                if process_text and reasoning_callback:
+                    reasoning_callback(process_text)
+                return
             if not (tool_start_callback or tool_complete_callback or tool_progress_callback):
                 return
-            kind = str(event.get("type") or "")
             tool_name = event.get("toolCallName") or event.get("tool_name")
             call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
             if not tool_name:
@@ -1341,6 +1515,21 @@ class NorthCoderTUIAgent:
         if self._pending_workspace_switch and self._workspace_switch_callback:
             cb_error = self._workspace_switch_callback(self._pending_workspace_switch)
             if cb_error is None:
+                selected_path = str(
+                    self._pending_workspace_switch.get("selected_path") or ""
+                )
+                project_name = str(
+                    self._pending_workspace_switch.get("project_name") or "项目"
+                )
+                success_text = (
+                    "已切换工作区\n\n"
+                    f"项目：{project_name}\n"
+                    f"路径：{selected_path}\n\n"
+                    "后续消息将在该路径中执行。"
+                )
+                result["final_response"] = success_text
+                self.history.append({"role": "assistant", "content": success_text})
+                result["messages"] = list(self.history)
                 # Callback succeeded: detach old North binding so the next turn
                 # creates a new North conversation with the correct workdir.
                 self.runtime.detach_session(self.session_key)

@@ -307,6 +307,103 @@ async def test_north_runtime_uses_composite_run_to_bind_workdir(tmp_path, aiohtt
 
 
 @pytest.mark.asyncio
+async def test_north_runtime_degrades_registration_failure_to_exact_workdir(
+    tmp_path, aiohttp_server
+):
+    run_payloads: list[dict[str, Any]] = []
+    message_payloads: list[dict[str, Any]] = []
+
+    async def composite_run(request):
+        payload = await request.json()
+        run_payloads.append(payload)
+        if len(run_payloads) == 1:
+            return web.json_response(
+                {
+                    "detail": {
+                        "code": "workdir_register_failed",
+                        "message": "detached worktree discovery failed",
+                    }
+                },
+                status=500,
+            )
+        return web.json_response(
+            {
+                "conversation_id": "conv-workdir-only",
+                "invocation_id": "inv-workdir-only-1",
+                "status": "running",
+            },
+            status=202,
+        )
+
+    async def send_message(request):
+        message_payloads.append(await request.json())
+        return web.json_response(
+            {"invocation_id": "inv-workdir-only-2", "status": "running"},
+            status=202,
+        )
+
+    async def invocation_result(request):
+        suffix = request.match_info["invocation_id"].rsplit("-", 1)[-1]
+        return web.json_response(
+            {
+                "status": "completed",
+                "blocks": [
+                    {
+                        "role": "assistant",
+                        "block_type": "text",
+                        "content": f"workdir-only-{suffix}",
+                    }
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_post(
+        "/api/conversations/conv-workdir-only/messages",
+        send_message,
+    )
+    app.router.add_get("/api/invocations/{invocation_id}/result", invocation_result)
+    server = await aiohttp_server(app)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url=f"http://{server.host}:{server.port}"),
+        tmp_path,
+    )
+
+    first = await runtime.run_turn(
+        message="inspect detached worktree",
+        session_key="detached-session",
+        hermes_session_id="hermes-detached",
+        workdir=str(tmp_path),
+    )
+    second = await runtime.run_turn(
+        message="continue analysis",
+        session_key="detached-session",
+        hermes_session_id="hermes-detached",
+        workdir=str(tmp_path),
+    )
+
+    assert len(run_payloads) == 2
+    assert run_payloads[0]["register_workdir"] is True
+    assert "register_workdir" not in run_payloads[1]
+    assert run_payloads[1]["workdir"] == str(tmp_path)
+    assert len(message_payloads) == 1
+    assert message_payloads[0]["content"] == "continue analysis"
+    assert first["north_conversation_id"] == "conv-workdir-only"
+    assert first["final_response"] == "workdir-only-1"
+    assert second["north_conversation_id"] == "conv-workdir-only"
+    assert second["final_response"] == "workdir-only-2"
+    assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
+        "detached-session": {
+            "conversation_id": "conv-workdir-only",
+            "workdir": str(tmp_path),
+            "workspace_id": None,
+            "workdir_only": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_north_runtime_re_registers_legacy_workspace_less_binding(tmp_path, aiohttp_server):
     """A pre-registration binding must not stay hidden from the North sidebar."""
     state_file = tmp_path / "north_coder_conversations.json"

@@ -4310,44 +4310,173 @@ def _make_north_workspace_switch_callback(
         hermes_home = Path(_hermes_home)
         db_path = hermes_home / "projects.db"
 
-        # Phase 1: Resolve project by id, slug, or name from projects.db (canonical source)
-        # get_project already supports id-or-slug lookup (tries ID first, then slug).
-        # We also support name lookup for canonical records via exact match.
+        # Resolve the live session before project adoption.  Its current cwd is
+        # the strongest ownership signal when historical/stale Project rows
+        # point at worktrees from the same Git repository.
+        key = session_id
+        session = None
+        with _sessions_lock:
+            if key in _sessions:
+                session = _sessions[key]
+            else:
+                for _sid, cand in _sessions.items():
+                    if (
+                        cand.get("session_key") == key
+                        or getattr(cand.get("agent"), "session_id", None) == key
+                    ):
+                        session = cand
+                        break
+        if session is None:
+            return f"no active session found for '{session_id}'"
+        session_cwd = os.path.abspath(
+            os.path.expanduser(str(session.get("cwd") or os.path.expanduser("~")))
+        )
+
+        # Phase 1: Resolve by id/slug/name, or adopt a real git worktree that
+        # shares a Git common dir with one canonical project folder.
+        selected_folder_path: Optional[str] = None
         try:
             if not db_path.is_file():
                 return f"no projects database at {db_path}"
             with connect_closing() as conn:
-                project = pdb.get_project(conn, str(project_id_input))
+                selector = str(project_id_input)
+                projects = pdb.list_projects(conn)
+                project = pdb.get_project(conn, selector)
                 if project is None:
-                    # Public canonical API: exact display-name fallback after the
-                    # id/slug resolver. Never trust a model-supplied path.
                     project = next(
-                        (
-                            candidate
-                            for candidate in pdb.list_projects(conn)
-                            if candidate.name == str(project_id_input)
-                        ),
+                        (candidate for candidate in projects if candidate.name == selector),
                         None,
                     )
+
+                if project is None and os.path.isabs(os.path.expanduser(selector)):
+                    requested = os.path.abspath(os.path.expanduser(selector))
+                    if not os.path.isdir(requested):
+                        return f"project path does not exist: {requested}"
+
+                    # Exact registered folder paths are canonical already.
+                    for candidate in projects:
+                        for folder in candidate.folders:
+                            canonical = os.path.abspath(os.path.expanduser(str(folder.path)))
+                            if canonical == requested:
+                                project = candidate
+                                selected_folder_path = canonical
+                                break
+                        if project is not None:
+                            break
+
+                    # A newly-created git worktree may not be registered yet.
+                    # Adopt it only when its Git common dir uniquely matches a
+                    # canonical project folder; arbitrary directories remain blocked.
                     if project is None:
-                        return f"project '{project_id_input}' not found in projects.db"
-                # Use canonical project ID for all subsequent operations
+                        def git_common_dir(path: str) -> Optional[str]:
+                            proc = subprocess.run(
+                                [
+                                    "git", "-C", path, "rev-parse",
+                                    "--path-format=absolute", "--git-common-dir",
+                                ],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                            )
+                            if proc.returncode != 0 or not proc.stdout.strip():
+                                return None
+                            return os.path.realpath(proc.stdout.strip())
+
+                        def git_dir(path: str) -> Optional[str]:
+                            proc = subprocess.run(
+                                [
+                                    "git", "-C", path, "rev-parse",
+                                    "--path-format=absolute", "--git-dir",
+                                ],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                            )
+                            if proc.returncode != 0 or not proc.stdout.strip():
+                                return None
+                            return os.path.realpath(proc.stdout.strip())
+
+                        requested_common = git_common_dir(requested)
+                        matches: dict[str, Any] = {}
+                        if requested_common:
+                            for candidate in projects:
+                                for folder in candidate.folders:
+                                    folder_path = os.path.abspath(
+                                        os.path.expanduser(str(folder.path))
+                                    )
+                                    if git_common_dir(folder_path) == requested_common:
+                                        matches[str(candidate.id)] = candidate
+                                        break
+                        matched_project = None
+                        if len(matches) == 1:
+                            matched_project = next(iter(matches.values()))
+                        elif len(matches) > 1:
+                            current_owners = []
+                            for candidate in matches.values():
+                                if any(
+                                    os.path.abspath(os.path.expanduser(str(folder.path)))
+                                    == session_cwd
+                                    for folder in candidate.folders
+                                ):
+                                    current_owners.append(candidate)
+                            if len(current_owners) == 1:
+                                matched_project = current_owners[0]
+                            else:
+                                # A linked worktree can be registered by several
+                                # historical Projects.  The canonical checkout is
+                                # the unique folder whose git-dir is the repository
+                                # common dir; linked worktrees use common/worktrees/*.
+                                canonical_owners = []
+                                if requested_common:
+                                    for candidate in matches.values():
+                                        if any(
+                                            git_dir(
+                                                os.path.abspath(
+                                                    os.path.expanduser(str(folder.path))
+                                                )
+                                            )
+                                            == requested_common
+                                            for folder in candidate.folders
+                                        ):
+                                            canonical_owners.append(candidate)
+                                if len(canonical_owners) == 1:
+                                    matched_project = canonical_owners[0]
+                                else:
+                                    return (
+                                        "worktree path matches multiple projects and the "
+                                        f"current session cwd cannot disambiguate ownership: {requested}"
+                                    )
+
+                        if matched_project is not None:
+                            project = matched_project
+                            selected_folder_path = requested
+                            pdb.add_folder(
+                                conn,
+                                str(project.id),
+                                requested,
+                                is_primary=False,
+                            )
+
+                if project is None:
+                    return f"project '{project_id_input}' not found in projects.db"
                 project_id = str(project.id)
         except Exception as exc:
             return f"failed to resolve project '{project_id_input}': {exc}"
 
-        # Phase 2: Resolve canonical path from the project, not the tool result
-        primary_path = None
-        if getattr(project, "primary_path", None):
-            primary_path = project.primary_path
-        else:
-            for folder in getattr(project, "folders", []) or []:
-                if getattr(folder, "is_primary", False):
-                    primary_path = folder.path
-                    break
-            if not primary_path:
-                folders = getattr(project, "folders", []) or []
-                primary_path = str(folders[0].path) if folders else None
+        # Phase 2: Use the canonical matched folder for path selectors; normal
+        # id/slug/name selectors continue to use the project's primary folder.
+        primary_path = selected_folder_path
+        if not primary_path:
+            if getattr(project, "primary_path", None):
+                primary_path = project.primary_path
+            else:
+                for folder in getattr(project, "folders", []) or []:
+                    if getattr(folder, "is_primary", False):
+                        primary_path = folder.path
+                        break
+                if not primary_path:
+                    folders = getattr(project, "folders", []) or []
+                    primary_path = str(folders[0].path) if folders else None
 
         if not primary_path:
             return f"project '{project_id}' has no primary path"
@@ -4356,22 +4485,7 @@ def _make_north_workspace_switch_callback(
         if not os.path.isdir(resolved):
             return f"project path does not exist: {resolved}"
 
-        # Phase 3: Verify live session exists BEFORE any mutation
-        key = session_id
-        session = None
-        with _sessions_lock:
-            if key in _sessions:
-                session = _sessions[key]
-            else:
-                for _sid, cand in _sessions.items():
-                    if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
-                        session = cand
-                        break
-
-        if session is None:
-            return f"no active session found for '{session_id}'"
-
-        # Phase 4: Save original active for rollback, then set active in DB
+        # Phase 3: Save original active for rollback, then set active in DB
         old_active_id = None
         try:
             with connect_closing() as conn:
@@ -4398,6 +4512,13 @@ def _make_north_workspace_switch_callback(
                 )
             return f"failed to apply project workspace: {exc}"
 
+        # Return canonical success details through the same mutable intent
+        # object.  project_switch is a stop-tool, so North will not produce a
+        # follow-up assistant turn; the facade uses these fields to emit a
+        # truthful user-visible receipt.
+        ws["canonical_project_id"] = project_id
+        ws["project_name"] = str(project.name)
+        ws["selected_path"] = resolved
         return None
 
     return callback
@@ -9685,11 +9806,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _run_signature = inspect.signature(agent.run_conversation)
                 if "task_id" in _run_signature.parameters:
                     run_kwargs["task_id"] = session["session_key"]
-                if "tool_progress_callback" in _run_signature.parameters:
+                _callback_names = {
+                    "tool_start_callback",
+                    "tool_complete_callback",
+                    "tool_progress_callback",
+                    "reasoning_callback",
+                }
+                if any(name in _run_signature.parameters for name in _callback_names):
                     _callbacks = _agent_cbs(sid)
-                    run_kwargs["tool_start_callback"] = _callbacks["tool_start_callback"]
-                    run_kwargs["tool_complete_callback"] = _callbacks["tool_complete_callback"]
-                    run_kwargs["tool_progress_callback"] = _callbacks["tool_progress_callback"]
+                    for name in _callback_names:
+                        if name in _run_signature.parameters:
+                            run_kwargs[name] = _callbacks[name]
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -9744,6 +9871,29 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            if getattr(
+                                agent, "gateway_managed_history_persistence", False
+                            ):
+                                try:
+                                    _ensure_session_db_row(session)
+                                    with _session_db(session) as scoped_db:
+                                        if scoped_db is not None:
+                                            stored_count = len(
+                                                scoped_db.get_messages(
+                                                    session["session_key"]
+                                                )
+                                            )
+                                            for message in result["messages"][stored_count:]:
+                                                scoped_db.append_message(
+                                                    session_id=session["session_key"],
+                                                    role=message.get("role", "assistant"),
+                                                    content=message.get("content"),
+                                                )
+                                except Exception:
+                                    logger.warning(
+                                        "failed to persist external-runtime TUI history",
+                                        exc_info=True,
+                                    )
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on

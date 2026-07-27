@@ -431,9 +431,10 @@ def _write_project_tool_yamls(output_dir: Path) -> None:
     (tool_dir / "project_list.tool.yaml").write_text("""type: tool
 name: project_list
 description: >-
-  List desktop Projects (named workspaces) and show which one is active.
-  A pure read-only query against the Hermes projects database — no side
-  effects, no DB mutations, no cwd changes.
+  List logical Hermes Projects and all registered folders/worktrees, including
+  folder added_at for resolving requests such as "the most recently created
+  worktree". active_id and primary_path do not identify the current worktree;
+  project_switch's Hermes success receipt selected_path is authoritative.
 input_schema:
   type: object
   properties: {}
@@ -442,16 +443,16 @@ input_schema:
     (tool_dir / "project_switch.tool.yaml").write_text("""type: tool
 name: project_switch
 description: >-
-  Switch to a desktop Project by name, slug, or id.  This is a pure intent:
-  the tool validates the project exists and its primary_path is a directory,
-  then returns structured JSON for the host to apply the switch.
+  Switch to a logical Hermes Project or one of its exact registered worktree
+  paths. This is a pure intent: the tool validates the selection, then returns
+  structured JSON for the host to apply the switch.
   The host applies the actual project switch (set_active, cwd, sidebar).
 input_schema:
   type: object
   properties:
     project:
       type: string
-      description: Project name, slug, or id
+      description: Project name, slug, id, or exact registered folder/worktree path
   required:
     - project
 """, encoding="utf-8")

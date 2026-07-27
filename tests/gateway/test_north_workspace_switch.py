@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -473,6 +474,170 @@ def test_make_north_workspace_switch_callback_false_rollback_old_active_none(mon
     finally:
         server._sessions.pop(sid, None)
         hermes_constants.reset_hermes_home_override(token)
+
+
+def test_new_worktree_uses_project_owning_current_session_cwd(monkeypatch, tmp_path):
+    """A new worktree is adopted by the Project that owns this session's cwd."""
+    import hermes_constants
+    import tui_gateway.server as server
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    stale = tmp_path / "stale-worktree"
+    target = tmp_path / "new-worktree"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    (repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "-m", "baseline",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "stale", str(stale)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "target", str(target)],
+        check=True,
+        capture_output=True,
+    )
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-sid-worktree-owner"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+        with pdb.connect_closing() as conn:
+            canonical_id = pdb.create_project(
+                conn, name="Canonical", slug="canonical",
+                folders=[str(repo)], primary_path=str(repo),
+            )
+            stale_id = pdb.create_project(
+                conn, name="Historical", slug="historical",
+                folders=[str(stale)], primary_path=str(stale),
+            )
+            # Deliberately point global active state at the wrong candidate.
+            pdb.set_active(conn, stale_id)
+
+        server._sessions[sid] = {
+            "session_key": sid,
+            "cwd": str(repo),
+            "agent": None,
+        }
+
+        def apply_workspace(task_id, path, _name=""):
+            assert task_id == sid
+            assert path == str(target)
+            server._sessions[sid]["cwd"] = path
+            return True
+
+        monkeypatch.setattr(server, "_apply_project_workspace", apply_workspace)
+        intent = {"project_id": str(target)}
+        result = server._make_north_workspace_switch_callback(sid)(intent)
+
+        assert result is None
+        assert intent["canonical_project_id"] == canonical_id
+        assert intent["selected_path"] == str(target)
+        assert server._sessions[sid]["cwd"] == str(target)
+        with pdb.connect_closing() as conn:
+            assert pdb.get_active_id(conn) == canonical_id
+            canonical = pdb.get_project(conn, canonical_id)
+            historical = pdb.get_project(conn, stale_id)
+            assert canonical is not None
+            assert historical is not None
+            assert str(target) in {folder.path for folder in canonical.folders}
+            assert str(target) not in {folder.path for folder in historical.folders}
+    finally:
+        server._sessions.pop(sid, None)
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_new_worktree_prefers_unique_canonical_git_owner_without_session_cwd(
+    monkeypatch, tmp_path,
+):
+    """Historical linked-worktree Projects must not shadow the canonical owner."""
+    import hermes_constants
+    import tui_gateway.server as server
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    stale = tmp_path / "stale-worktree"
+    target = tmp_path / "new-worktree"
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    (repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "-m", "baseline",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "stale", str(stale)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "target", str(target)],
+        check=True,
+        capture_output=True,
+    )
+
+    token = hermes_constants.set_hermes_home_override(str(home))
+    sid = "test-sid-canonical-owner"
+    try:
+        monkeypatch.setattr(server, "_hermes_home", str(home))
+        with pdb.connect_closing() as conn:
+            canonical_id = pdb.create_project(
+                conn, name="Canonical", slug="canonical",
+                folders=[str(repo)], primary_path=str(repo),
+            )
+            pdb.create_project(
+                conn, name="Historical A", slug="historical-a",
+                folders=[str(stale)], primary_path=str(stale),
+            )
+            pdb.create_project(
+                conn, name="Historical B", slug="historical-b",
+                folders=[str(stale)], primary_path=str(stale),
+            )
+
+        server._sessions[sid] = {
+            "session_key": sid,
+            "cwd": str(unrelated),
+            "agent": None,
+        }
+
+        def apply_workspace(task_id, path, _name=""):
+            server._sessions[task_id]["cwd"] = path
+            return True
+
+        monkeypatch.setattr(server, "_apply_project_workspace", apply_workspace)
+        intent = {"project_id": str(target)}
+        result = server._make_north_workspace_switch_callback(sid)(intent)
+
+        assert result is None
+        assert intent["canonical_project_id"] == canonical_id
+        assert intent["selected_path"] == str(target)
+        with pdb.connect_closing() as conn:
+            canonical = pdb.get_project(conn, canonical_id)
+            assert canonical is not None
+            assert str(target) in {folder.path for folder in canonical.folders}
+    finally:
+        server._sessions.pop(sid, None)
+        hermes_constants.reset_hermes_home_override(token)
+
 
 def test_tui_callback_no_workspace_switch_noop():
     """Without workspace_switch, callback must NOT be invoked."""

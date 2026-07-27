@@ -91,12 +91,25 @@ def project_list_intent() -> str:
 
         return json.dumps({
             "active_id": active,
+            "note": (
+                "active_id identifies the logical project, not a specific worktree. "
+                "Multiple folders can belong to one project. After project_switch, "
+                "the Hermes success receipt selected_path is authoritative."
+            ),
             "projects": [
                 {
                     "id": p.id,
                     "slug": getattr(p, "slug", ""),
                     "name": p.name,
                     "primary_path": _primary_path(p),
+                    "folders": [
+                        {
+                            "path": str(folder.path),
+                            "is_primary": bool(folder.is_primary),
+                            "added_at": getattr(folder, "added_at", None),
+                        }
+                        for folder in p.folders
+                    ],
                     "active": p.id == active,
                 }
                 for p in projects
@@ -140,14 +153,26 @@ def project_switch_intent(project: str) -> str:
     try:
         with pdb.connect_closing() as conn:
             proj = _resolve_project(conn, token)
+            selected_path = None
+            if proj is None and Path(token).expanduser().is_absolute():
+                requested = str(Path(token).expanduser().resolve())
+                for candidate in pdb.list_projects(conn):
+                    for folder in candidate.folders:
+                        canonical = str(Path(folder.path).expanduser().resolve())
+                        if canonical == requested:
+                            proj = candidate
+                            selected_path = canonical
+                            break
+                    if proj is not None:
+                        break
             if proj is None:
                 return json.dumps({"success": False, "error": f"no project matching '{project}'"})
 
-            primary_path = _primary_path(proj)
-            if not primary_path:
+            target_path = selected_path or _primary_path(proj)
+            if not target_path:
                 return json.dumps({"success": False, "error": "project has no primary path"})
 
-            resolved_path = str(Path(primary_path).expanduser().resolve())
+            resolved_path = str(Path(target_path).expanduser().resolve())
             if not Path(resolved_path).is_dir():
                 return json.dumps({
                     "success": False,

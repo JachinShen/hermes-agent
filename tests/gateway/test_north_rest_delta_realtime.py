@@ -224,6 +224,114 @@ async def test_ws_and_rest_same_delta_dedup(aiohttp_server, tmp_path):
     assert result.get("completed") is True
 
 
+@pytest.mark.asyncio
+async def test_tui_facade_separates_process_text_from_final_answer(
+    aiohttp_server, monkeypatch, tmp_path,
+):
+    """North 多阶段 assistant blocks 不得在 TUI 最终正文中 concat。"""
+
+    async def composite_run(request):
+        return web.json_response({
+            "conversation_id": "conv-process",
+            "workspace_id": "home-default",
+            "invocation_id": "inv-process",
+            "status": "running",
+        }, status=202)
+
+    polls = 0
+
+    async def invocation_result(request):
+        nonlocal polls
+        polls += 1
+        blocks = [
+            {
+                "position": 1,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "先检查仓库和发布入口。",
+            },
+            {
+                "position": 2,
+                "role": "assistant",
+                "block_type": "tool_use",
+                "content": json.dumps({
+                    "id": "call-check",
+                    "name": "run_shell_command",
+                    "input": {"command": "git status --short"},
+                }),
+            },
+            {
+                "position": 3,
+                "role": "assistant",
+                "block_type": "tool_result",
+                "content": json.dumps({
+                    "toolUseId": "call-check",
+                    "content": "clean",
+                    "isError": False,
+                }),
+            },
+        ]
+        if polls >= 2:
+            blocks.append({
+                "position": 4,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "发布检查完成。",
+            })
+        return web.json_response({
+            "status": "completed" if polls >= 2 else "running",
+            "blocks": blocks,
+        })
+
+    async def websocket(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_json({"type": "run_finished"})
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_post("/api/run", composite_run)
+    app.router.add_get("/api/invocations/{inv_id}/result", invocation_result)
+    app.router.add_get("/ws/conversation/{conv_id}", websocket)
+    server = await aiohttp_server(app)
+
+    monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: tmp_path)
+    runtime = NorthCoderRuntime(
+        NorthCoderRuntimeConfig(
+            base_url=f"http://{server.host}:{server.port}",
+            timeout_seconds=10.0,
+            seed_token_budget=2000,
+            workspace_id="home-default",
+            state_file=str(tmp_path / "bindings.json"),
+            tui_variant=True,
+            workspace_switch_supported=True,
+        ),
+        tmp_path,
+    )
+    agent = NorthCoderTUIAgent(runtime, "process-session")
+    deltas: list[str] = []
+    reasoning: list[str] = []
+    tool_starts: list[tuple[str, str]] = []
+    tool_completes: list[tuple[str, str]] = []
+
+    result = await asyncio.to_thread(
+        agent.run_conversation,
+        "执行发布检查",
+        stream_callback=deltas.append,
+        reasoning_callback=reasoning.append,
+        tool_start_callback=lambda call_id, name, _args: tool_starts.append((call_id, name)),
+        tool_complete_callback=lambda call_id, name, _args, _result: tool_completes.append((call_id, name)),
+        tool_progress_callback=lambda *_args, **_kwargs: None,
+    )
+
+    assert "".join(deltas) == "发布检查完成。"
+    assert result["final_response"] == "发布检查完成。"
+    assert reasoning == ["先检查仓库和发布入口。"]
+    assert tool_starts == [("call-check", "run_shell_command")]
+    assert tool_completes == [("call-check", "run_shell_command")]
+
+
 # ======================================================================
 # Seam B: stop-tool project_switch — REST tool_use blocks
 
@@ -462,6 +570,12 @@ async def test_tui_facade_real_runtime_project_switch_via_tool_use(
     assert [m.get("content") for m in agent.history] == [
         "switch to project test-project",
         "Switching to new project...",
+        (
+            "已切换工作区\n\n"
+            "项目：test-project\n"
+            "路径：\n\n"
+            "后续消息将在该路径中执行。"
+        ),
         "follow-up in the new workspace",
         "Follow-up response",
     ]
