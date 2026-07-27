@@ -1528,11 +1528,16 @@ class NorthCoderTUIAgent:
                     "后续消息将在该路径中执行。"
                 )
                 result["final_response"] = success_text
-                self.history.append({"role": "assistant", "content": success_text})
+                if not (
+                    self.history
+                    and self.history[-1].get("role") == "assistant"
+                    and self.history[-1].get("content") == success_text
+                ):
+                    self.history.append({"role": "assistant", "content": success_text})
                 result["messages"] = list(self.history)
-                # Callback succeeded: detach old North binding so the next turn
-                # creates a new North conversation with the correct workdir.
-                self.runtime.detach_session(self.session_key)
+                # Keep the old binding until the next run.  run_turn detects
+                # existing_workdir != effective_workdir and performs a
+                # composite rebind, preserving the provider session/history.
                 self._pending_workspace_switch = None
             else:
                 # Callback failed: keep old binding, mark turn as failed.
@@ -1545,6 +1550,17 @@ class NorthCoderTUIAgent:
                     "The workspace switch could not be applied. "
                     "Your session remains in the previous context."
                 )
+                failure_receipt = {
+                    "role": "assistant",
+                    "content": result["final_response"],
+                }
+                if not (
+                    self.history
+                    and self.history[-1].get("role") == "assistant"
+                    and self.history[-1].get("content") == failure_receipt["content"]
+                ):
+                    self.history.append(failure_receipt)
+                result["messages"] = list(self.history)
                 logger.warning(
                     "Workspace switch callback failed for session %s: %s",
                     self.session_key, error_msg,

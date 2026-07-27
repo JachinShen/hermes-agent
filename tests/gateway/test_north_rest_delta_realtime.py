@@ -531,8 +531,8 @@ async def test_tui_facade_real_runtime_project_switch_via_tool_use(
     )
 
     # Round 1 exercises the public synchronous facade. The callback must be
-    # invoked by production parsing, and successful application must detach the
-    # old provider conversation while retaining the Hermes facade/session.
+    # invoked by production parsing.  A successful application keeps the old
+    # provider binding until the next run's workdir mismatch triggers rebind.
     result1 = await asyncio.to_thread(
         agent.run_conversation,
         "switch to project test-project",
@@ -541,7 +541,7 @@ async def test_tui_facade_real_runtime_project_switch_via_tool_use(
     assert callback_calls[0]["project_id"] == "test-project"
     assert agent.session_key == "sess-real-switch"
     conv_id1, _, _ = await runtime._conversation_binding("sess-real-switch")
-    assert conv_id1 is None, "workspace switch 后旧 North binding 应被 detach"
+    assert conv_id1 == "conv-old", "successful switch must retain old binding until next run"
 
     # Round 2 reuses the exact same facade/session. resolve_agent_cwd now points
     # at the callback-selected workspace, so North must create a fresh provider

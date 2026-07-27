@@ -22,10 +22,10 @@ from tools.registry import registry
 # ``(task_id, primary_path, project_name)`` and re-anchors that session's
 # workspace + refreshes the sidebar. ``None`` in CLI / messaging contexts — the
 # DB write still happens; there's just no live GUI session to move.
-_workspace_callback: Optional[Callable[[str, str, str], None]] = None
+_workspace_callback: Optional[Callable[[str, str, str], bool]] = None
 
 
-def set_project_workspace_callback(fn: Optional[Callable[[str, str, str], None]]) -> None:
+def set_project_workspace_callback(fn: Optional[Callable[[str, str, str], bool]]) -> None:
     global _workspace_callback
     _workspace_callback = fn
 
@@ -39,13 +39,15 @@ def _primary_path(proj) -> Optional[str]:
     return proj.folders[0].path if proj.folders else None
 
 
-def _apply_workspace(task_id: Optional[str], path: Optional[str], name: str) -> None:
+def _apply_workspace(task_id: Optional[str], path: Optional[str], name: str) -> bool:
     cb = _workspace_callback
-    if cb and task_id and path:
-        try:
-            cb(task_id, path, name)
-        except Exception:
-            pass
+    if not (cb and task_id and path):
+        return True
+    try:
+        result = cb(task_id, path, name)
+        return result is not False
+    except Exception:
+        return False
 
 
 def _resolve(conn, token: str):
@@ -122,7 +124,6 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
     try:
         with pdb.connect_closing() as conn:
             pid = pdb.create_project(conn, name=name, folders=[folder] if folder else [], primary_path=folder or None)
-            pdb.set_active(conn, pid)
             proj = pdb.get_project(conn, pid)
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
@@ -131,9 +132,22 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
         return json.dumps({"success": False, "error": "project vanished after create"})
 
     primary = _primary_path(proj)
-    _apply_workspace(task_id, primary, proj.name)
-
-    return json.dumps({"success": True, "id": proj.id, "slug": proj.slug, "name": proj.name, "primary_path": primary})
+    workspace_switched = _apply_workspace(task_id, primary, proj.name)
+    receipt = {
+        "success": True,
+        "id": proj.id,
+        "slug": proj.slug,
+        "name": proj.name,
+        "primary_path": primary,
+        "workspace_switched": bool(primary and workspace_switched),
+    }
+    if primary and not workspace_switched:
+        receipt.update({
+            "partial": True,
+            "warning": "project created, but the session workdir could not be switched",
+            "error": "failed to switch session workdir",
+        })
+    return json.dumps(receipt)
 
 
 def project_switch(project: str, task_id: Optional[str] = None) -> str:
@@ -156,10 +170,17 @@ def project_switch(project: str, task_id: Optional[str] = None) -> str:
                     break
         if proj is None:
             return json.dumps({"success": False, "error": f"no project matching '{project}'"})
-        pdb.set_active(conn, proj.id)
-
     target_path = selected_path or _primary_path(proj)
-    _apply_workspace(task_id, target_path, proj.name)
+    workspace_switched = _apply_workspace(task_id, target_path, proj.name)
+    if not workspace_switched:
+        return json.dumps({
+            "success": False,
+            "error": "failed to switch session workdir",
+            "id": proj.id,
+            "slug": proj.slug,
+            "name": proj.name,
+            "primary_path": _primary_path(proj),
+        })
 
     return json.dumps({
         "success": True,
@@ -168,6 +189,8 @@ def project_switch(project: str, task_id: Optional[str] = None) -> str:
         "name": proj.name,
         "primary_path": _primary_path(proj),
         "selected_path": target_path,
+        "workspace_switched": bool(target_path),
+        "workspace_switch": {"project_id": proj.id, "project_name": proj.name, "path": target_path},
     })
 
 
@@ -192,10 +215,11 @@ registry.register(
     schema={
         "name": "project_create",
         "description": (
-            "Create a desktop Project (a named workspace) and switch this chat into it. "
-            "Pass `path` to anchor it to a repo/folder — this chat's workspace moves there "
-            "and the sidebar follows. Use when starting work in a new repo/folder; this is "
-            "the intentional way to move the session, not `cd`."
+            "Create a desktop Project (a named workspace). Pass `path` to also request "
+            "switching this chat into that folder. The receipt reports the created Project "
+            "truthfully: success remains true if Project creation succeeds but workspace "
+            "switching is partial; inspect workspace_switched, partial, warning, and error. "
+            "This is the intentional way to move the session, not `cd`."
         ),
         "parameters": {
             "type": "object",

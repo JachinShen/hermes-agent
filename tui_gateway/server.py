@@ -2051,7 +2051,9 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
                 return
             with _session_db(db_session) as db:
                 if db is not None:
-                    db.update_session_cwd(session_key, cwd, branch, root)
+                    db.update_session_git_metadata_if_cwd_matches(
+                        session_key, cwd, branch, root
+                    )
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
@@ -4219,306 +4221,124 @@ def _agent_cbs(sid: str) -> dict:
     }
 
 
-def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> bool:
-    """Intentional workspace move from the project_* tools: re-anchor the live
-    session's cwd to the chosen project's folder and push session.info so the
-    desktop follows (refresh tree + scope into the project). This is the ONLY
-    auto-cwd path — driven by an explicit tool call, never a terminal `cd`.
+_session_workdir_service = None
+_session_workdir_service_lock = threading.Lock()
 
-    Returns True on success, False on any failure.
-    """
+
+def _workspace_find_session(key: str):
+    with _sessions_lock:
+        matches = []
+        for sid, candidate in _sessions.items():
+            if sid == key or candidate.get("session_key") == key:
+                matches.append(candidate)
+                continue
+            if getattr(candidate.get("agent"), "session_id", None) == key:
+                matches.append(candidate)
+        unique = {id(candidate): candidate for candidate in matches}
+        if len(unique) > 1:
+            return None
+        return next(iter(unique.values()), None)
+
+
+def _workspace_registered_paths() -> set[str]:
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.projects_db import connect_closing
+    with connect_closing() as conn:
+        return {
+            str(folder.path)
+            for item in pdb.list_projects(conn, include_archived=True)
+            for folder in item.folders
+        }
+
+
+def _workspace_persist_cwd(session: dict[str, Any], cwd: str) -> None:
+    with _session_db(session) as db:
+        if db is None:
+            raise RuntimeError("session database unavailable")
+        db.update_session_cwd(session.get("session_key", ""), cwd)
+
+
+def _workspace_terminal_snapshot(key: str):
+    from tools.terminal_tool import snapshot_task_cwd_state
+    return snapshot_task_cwd_state(key)
+
+
+def _workspace_terminal_apply(key: str, cwd: str) -> None:
+    from tools.terminal_tool import register_task_env_overrides
+    register_task_env_overrides(key, {"cwd": cwd})
+
+
+def _workspace_terminal_restore(key: str, snapshot) -> None:
+    from tools.terminal_tool import restore_task_cwd
+    restore_task_cwd(key, snapshot or {})
+
+
+def _get_session_workdir_service():
+    global _session_workdir_service
+    if _session_workdir_service is None:
+        with _session_workdir_service_lock:
+            if _session_workdir_service is None:
+                from tui_gateway.session_workdir import SessionWorkdirContext, SessionWorkdirService
+                _session_workdir_service = SessionWorkdirService(SessionWorkdirContext(
+                    session_lookup=_workspace_find_session,
+                    registered_paths=_workspace_registered_paths,
+                    persist_cwd=_workspace_persist_cwd,
+                    terminal_snapshot=_workspace_terminal_snapshot,
+                    terminal_apply=_workspace_terminal_apply,
+                    terminal_restore=_workspace_terminal_restore,
+                    git_metadata=lambda s, cwd: _persist_session_git_meta(s, cwd),
+                    emit_session_info=lambda sid, info: _emit("session.info", sid, info),
+                    session_info=lambda s: _session_info(s.get("agent"), s),
+                ))
+    return _session_workdir_service
+
+
+def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> bool:
+    """Apply a project path through the process-wide workspace service."""
     if not path:
         return False
-
-    # The tool's task_id is the durable session_key, but _sessions is keyed by a
-    # short sid uuid (and the desktop routes events by that sid). Resolve it.
-    key = str(task_id or "")
-    sid = ""
-    session = None
-    with _sessions_lock:
-        if key in _sessions:
-            sid, session = key, _sessions[key]
-        else:
-            for cand_sid, cand in _sessions.items():
-                if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
-                    sid, session = cand_sid, cand
-                    break
-
-    if session is None:
-        return False
-
-    resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if not os.path.isdir(resolved):
-        return False
-
-    try:
-        session["cwd"] = resolved
-        session["explicit_cwd"] = True
-        _register_session_cwd(session)
-
-        with _session_db(session) as db:
-            if db is not None:
-                try:
-                    db.update_session_cwd(session.get("session_key", ""), resolved)
-                except Exception:
-                    logger.debug("failed to persist project workspace cwd", exc_info=True)
-
-        _persist_session_git_meta(session, resolved)
-
-        try:
-            agent = session.get("agent")
-            info = (
-                _session_info(agent, session)
-                if agent is not None
-                else {"cwd": resolved, "branch": _git_branch_for_cwd(resolved), "lazy": True}
-            )
-            _emit("session.info", sid, info)
-        except Exception:
-            logger.debug("failed to emit session.info after project workspace move", exc_info=True)
-    except Exception:
-        return False
-
-    return True
+    receipt = _get_session_workdir_service().switch(str(task_id), path)
+    return receipt.success
 
 
 def _make_north_workspace_switch_callback(
     session_id: str,
 ) -> Callable[[dict[str, Any]], Optional[str]]:
-    """Build a workspace_switch callback injected into North TUI agents.
-
-    The callback is invoked by ``NorthCoderTUIAgent.run_conversation`` after
-    a successful North turn that contains a ``project_switch`` tool result.
-
-    Order of operations:
-    1. Re-resolve the project by *project_id* from projects.db (canonical)
-    2. Verify the live session still exists (fail if not)
-    3. Set the project active in projects.db
-    4. Apply workspace cwd via _apply_project_workspace (reused)
-    5. If cwd application fails, rollback set_active to original
-    6. Only on full success, return None (detach proceeds)
-
-    Returns ``None`` on success, or an error string on failure.
-    """
+    """Apply North's path intent without changing Project ownership."""
     from hermes_cli import projects_db as pdb
     from hermes_cli.projects_db import connect_closing
 
     def callback(ws: dict[str, Any]) -> Optional[str]:
-        project_id_input = ws.get("project_id", "")
-        if not project_id_input:
-            return "workspace_switch missing project_id"
-
-        hermes_home = Path(_hermes_home)
-        db_path = hermes_home / "projects.db"
-
-        # Resolve the live session before project adoption.  Its current cwd is
-        # the strongest ownership signal when historical/stale Project rows
-        # point at worktrees from the same Git repository.
-        key = session_id
-        session = None
-        with _sessions_lock:
-            if key in _sessions:
-                session = _sessions[key]
-            else:
-                for _sid, cand in _sessions.items():
-                    if (
-                        cand.get("session_key") == key
-                        or getattr(cand.get("agent"), "session_id", None) == key
-                    ):
-                        session = cand
-                        break
-        if session is None:
+        if _workspace_find_session(session_id) is None:
             return f"no active session found for '{session_id}'"
-        session_cwd = os.path.abspath(
-            os.path.expanduser(str(session.get("cwd") or os.path.expanduser("~")))
-        )
-
-        # Phase 1: Resolve by id/slug/name, or adopt a real git worktree that
-        # shares a Git common dir with one canonical project folder.
-        selected_folder_path: Optional[str] = None
-        try:
-            if not db_path.is_file():
-                return f"no projects database at {db_path}"
+        selector = str(ws.get("project") or ws.get("project_id") or "").strip()
+        path = str(ws.get("path") or ws.get("selected_path") or "").strip()
+        if not path and selector and os.path.isabs(os.path.expanduser(selector)):
+            path = selector
+        if not path and selector:
             with connect_closing() as conn:
-                selector = str(project_id_input)
-                projects = pdb.list_projects(conn)
-                project = pdb.get_project(conn, selector)
-                if project is None:
-                    project = next(
-                        (candidate for candidate in projects if candidate.name == selector),
-                        None,
-                    )
-
-                if project is None and os.path.isabs(os.path.expanduser(selector)):
-                    requested = os.path.abspath(os.path.expanduser(selector))
-                    if not os.path.isdir(requested):
-                        return f"project path does not exist: {requested}"
-
-                    # Exact registered folder paths are canonical already.
-                    for candidate in projects:
-                        for folder in candidate.folders:
-                            canonical = os.path.abspath(os.path.expanduser(str(folder.path)))
-                            if canonical == requested:
-                                project = candidate
-                                selected_folder_path = canonical
-                                break
-                        if project is not None:
-                            break
-
-                    # A newly-created git worktree may not be registered yet.
-                    # Adopt it only when its Git common dir uniquely matches a
-                    # canonical project folder; arbitrary directories remain blocked.
-                    if project is None:
-                        def git_common_dir(path: str) -> Optional[str]:
-                            proc = subprocess.run(
-                                [
-                                    "git", "-C", path, "rev-parse",
-                                    "--path-format=absolute", "--git-common-dir",
-                                ],
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if proc.returncode != 0 or not proc.stdout.strip():
-                                return None
-                            return os.path.realpath(proc.stdout.strip())
-
-                        def git_dir(path: str) -> Optional[str]:
-                            proc = subprocess.run(
-                                [
-                                    "git", "-C", path, "rev-parse",
-                                    "--path-format=absolute", "--git-dir",
-                                ],
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if proc.returncode != 0 or not proc.stdout.strip():
-                                return None
-                            return os.path.realpath(proc.stdout.strip())
-
-                        requested_common = git_common_dir(requested)
-                        matches: dict[str, Any] = {}
-                        if requested_common:
-                            for candidate in projects:
-                                for folder in candidate.folders:
-                                    folder_path = os.path.abspath(
-                                        os.path.expanduser(str(folder.path))
-                                    )
-                                    if git_common_dir(folder_path) == requested_common:
-                                        matches[str(candidate.id)] = candidate
-                                        break
-                        matched_project = None
-                        if len(matches) == 1:
-                            matched_project = next(iter(matches.values()))
-                        elif len(matches) > 1:
-                            current_owners = []
-                            for candidate in matches.values():
-                                if any(
-                                    os.path.abspath(os.path.expanduser(str(folder.path)))
-                                    == session_cwd
-                                    for folder in candidate.folders
-                                ):
-                                    current_owners.append(candidate)
-                            if len(current_owners) == 1:
-                                matched_project = current_owners[0]
-                            else:
-                                # A linked worktree can be registered by several
-                                # historical Projects.  The canonical checkout is
-                                # the unique folder whose git-dir is the repository
-                                # common dir; linked worktrees use common/worktrees/*.
-                                canonical_owners = []
-                                if requested_common:
-                                    for candidate in matches.values():
-                                        if any(
-                                            git_dir(
-                                                os.path.abspath(
-                                                    os.path.expanduser(str(folder.path))
-                                                )
-                                            )
-                                            == requested_common
-                                            for folder in candidate.folders
-                                        ):
-                                            canonical_owners.append(candidate)
-                                if len(canonical_owners) == 1:
-                                    matched_project = canonical_owners[0]
-                                else:
-                                    return (
-                                        "worktree path matches multiple projects and the "
-                                        f"current session cwd cannot disambiguate ownership: {requested}"
-                                    )
-
-                        if matched_project is not None:
-                            project = matched_project
-                            selected_folder_path = requested
-                            pdb.add_folder(
-                                conn,
-                                str(project.id),
-                                requested,
-                                is_primary=False,
-                            )
-
-                if project is None:
-                    return f"project '{project_id_input}' not found in projects.db"
-                project_id = str(project.id)
-        except Exception as exc:
-            return f"failed to resolve project '{project_id_input}': {exc}"
-
-        # Phase 2: Use the canonical matched folder for path selectors; normal
-        # id/slug/name selectors continue to use the project's primary folder.
-        primary_path = selected_folder_path
-        if not primary_path:
-            if getattr(project, "primary_path", None):
-                primary_path = project.primary_path
-            else:
-                for folder in getattr(project, "folders", []) or []:
-                    if getattr(folder, "is_primary", False):
-                        primary_path = folder.path
-                        break
-                if not primary_path:
-                    folders = getattr(project, "folders", []) or []
-                    primary_path = str(folders[0].path) if folders else None
-
-        if not primary_path:
-            return f"project '{project_id}' has no primary path"
-
-        resolved = os.path.abspath(os.path.expanduser(str(primary_path)))
-        if not os.path.isdir(resolved):
-            return f"project path does not exist: {resolved}"
-
-        # Phase 3: Save original active for rollback, then set active in DB
-        old_active_id = None
-        try:
-            with connect_closing() as conn:
-                old_active_id = pdb.get_active_id(conn)
-                pdb.set_active(conn, project_id)
-        except Exception as exc:
-            return f"failed to set active project: {exc}"
-
-        # Phase 5: Apply workspace cwd via _apply_project_workspace
-        try:
-            # _apply_project_workspace returns True on success, False on failure
-            # (not a void call — must check the bool)
-            if not _apply_project_workspace(key, resolved):
-                raise RuntimeError("_apply_project_workspace returned False")
-        except Exception as exc:
-            # Rollback: restore original active (or clear if was None)
-            try:
-                with connect_closing() as conn:
-                    pdb.set_active(conn, old_active_id)
-            except Exception as rollback_exc:
-                logger.error(
-                    "Failed to rollback project active after cwd error: %s",
-                    rollback_exc,
-                )
-            return f"failed to apply project workspace: {exc}"
-
-        # Return canonical success details through the same mutable intent
-        # object.  project_switch is a stop-tool, so North will not produce a
-        # follow-up assistant turn; the facade uses these fields to emit a
-        # truthful user-visible receipt.
-        ws["canonical_project_id"] = project_id
-        ws["project_name"] = str(project.name)
-        ws["selected_path"] = resolved
+                projects = pdb.list_projects(conn, include_archived=True)
+                exact = [p for p in projects if selector in (str(p.id), p.slug) or p.name == selector]
+                if not exact:
+                    low = selector.lower()
+                    exact = [p for p in projects if p.slug.lower() == low or p.name.lower() == low]
+                if len(exact) != 1:
+                    return f"project selector '{selector}' is ambiguous or not found"
+                project = exact[0]
+                path = str(project.primary_path or "")
+                if not path:
+                    path = next((f.path for f in project.folders if f.is_primary), "")
+                if not path and project.folders:
+                    path = project.folders[0].path
+        if not path:
+            return "workspace_switch missing project or absolute path"
+        receipt = _get_session_workdir_service().switch(session_id, path)
+        if not receipt.success:
+            detail = receipt.error or "unknown error"
+            if receipt.rollback_error:
+                detail += f"; {receipt.rollback_error}"
+            return f"failed to switch session workdir: {detail}"
+        ws["selected_path"] = receipt.path
         return None
 
     return callback
@@ -4528,7 +4348,6 @@ def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
-
     set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
 

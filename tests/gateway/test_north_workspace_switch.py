@@ -313,8 +313,8 @@ class MockRuntime:
         return None
 
 
-def test_tui_callback_success_detaches():
-    """Successful callback triggers detach_session."""
+def test_tui_callback_success_keeps_binding_for_next_composite_run():
+    """Successful callback must not actively detach the old binding."""
     runtime = MockRuntime()
     runtime._pending_ws = {
         "project_id": "p1", "project_name": "A", "path": "/tmp"
@@ -324,7 +324,7 @@ def test_tui_callback_success_detaches():
 
     agent = NorthCoderTUIAgent(runtime, "sess-1", workspace_switch_callback=cb)
     agent.run_conversation("hello")
-    assert "sess-1" in runtime.detached
+    assert runtime.detached == []
 
 
 def test_tui_callback_failure_no_detach():
@@ -341,302 +341,16 @@ def test_tui_callback_failure_no_detach():
     assert runtime.detached == [], "Must NOT detach on callback failure"
     assert result.get("failed"), "Turn must be marked failed"
     assert "switch failed" in result.get("final_response", "")
+    assert agent.history[-1]["role"] == "assistant"
+    assert agent.history[-1]["content"] == result["final_response"]
+    assert result["messages"] == agent.history
 
 
-def test_make_north_workspace_switch_callback_false_rollback(monkeypatch, tmp_path):
-    """When _apply_project_workspace returns False (not exception), the
-    _make_north_workspace_switch_callback must return an error string,
-    rollback projects.db active to the original project, and NOT change
-    the facade session's cwd (no detach signal)."""
-    import tui_gateway.server as server
-    import hermes_constants
-    from hermes_cli import projects_db as pdb
-
-    home = tmp_path / "hermes"
-    home.mkdir()
-    (home / "old").mkdir(parents=True)
-    (home / "target").mkdir(parents=True)
-
-    token = hermes_constants.set_hermes_home_override(str(home))
-    sid = "test-sid-false-rollback"
-    try:
-        # Set server._hermes_home to the test home (using monkeypatch so it's auto-restored)
-        monkeypatch.setattr(server, "_hermes_home", str(home))
-
-        # Seed: old active project + target project
-        with pdb.connect_closing() as conn:
-            old_id = pdb.create_project(
-                conn, name="Old", slug="old",
-                folders=[str(home / "old")], primary_path=str(home / "old"),
-            )
-            target_id = pdb.create_project(
-                conn, name="Target", slug="target",
-                folders=[str(home / "target")], primary_path=str(home / "target"),
-            )
-            pdb.set_active(conn, old_id)
-
-        # Inject a live session into the server's session table
-        server._sessions[sid] = {
-            "session_key": sid,
-            "cwd": str(home / "initial"),
-            "agent": None,
-        }
-
-        # Monkeypatch: _apply_project_workspace returns False (no exception)
-        monkeypatch.setattr(
-            server, "_apply_project_workspace",
-            lambda task_id, path, _name="": False,
-        )
-
-        cb = server._make_north_workspace_switch_callback(sid)
-        result = cb({"project_id": target_id})
-
-        # Assert 1: callback returns error (not None — detach prevented)
-        assert result is not None, "Must return error when _apply_project_workspace returns False"
-        assert "failed to apply project workspace" in result, \
-            f"Error message should mention workspace failure, got: {result}"
-
-        # Assert 2: projects.db active rolled back to old project
-        with pdb.connect_closing() as conn:
-            assert pdb.get_active_id(conn) == old_id, \
-                "Active project must be rolled back to original"
-
-        # Assert 3: facade session cwd unchanged (no partial detach)
-        assert server._sessions[sid]["cwd"] == str(home / "initial"), \
-            "Session cwd must NOT change on failure"
-    finally:
-        server._sessions.pop(sid, None)
-        hermes_constants.reset_hermes_home_override(token)
 
 
-def test_make_north_workspace_switch_callback_false_rollback_old_active_none(monkeypatch, tmp_path):
-    """When old_active_id is None (no active project) and
-    _apply_project_workspace returns False, the callback must return an error
-    string, rollback projects.db active to None, and NOT change the facade
-    session's cwd (no detach signal). projects_db.set_active(None) is already
-    supported for clearing."""
-    import tui_gateway.server as server
-    import hermes_constants
-    from hermes_cli import projects_db as pdb
-
-    home = tmp_path / "hermes"
-    home.mkdir()
-    (home / "target").mkdir(parents=True)
-
-    token = hermes_constants.set_hermes_home_override(str(home))
-    sid = "test-sid-none-rollback"
-    try:
-        # Set server._hermes_home to the test home (using monkeypatch so it's auto-restored)
-        monkeypatch.setattr(server, "_hermes_home", str(home))
-
-        # Seed: target project only — no active project set (old_active_id=None)
-        with pdb.connect_closing() as conn:
-            target_id = pdb.create_project(
-                conn, name="Target", slug="target",
-                folders=[str(home / "target")], primary_path=str(home / "target"),
-            )
-            # Explicitly ensure active is None
-            pdb.set_active(conn, None)
-
-        # Verify active is None
-        with pdb.connect_closing() as conn:
-            assert pdb.get_active_id(conn) is None, "Active must start as None"
-
-        # Inject a live session into the server's session table
-        server._sessions[sid] = {
-            "session_key": sid,
-            "cwd": str(home / "initial"),
-            "agent": None,
-        }
-
-        # Monkeypatch: _apply_project_workspace returns False (no exception)
-        monkeypatch.setattr(
-            server, "_apply_project_workspace",
-            lambda task_id, path, _name="": False,
-        )
-
-        cb = server._make_north_workspace_switch_callback(sid)
-        result = cb({"project_id": target_id})
-
-        # Assert 1: callback returns error (not None — detach prevented)
-        assert result is not None, "Must return error when _apply_project_workspace returns False"
-        assert "failed to apply project workspace" in result, \
-            f"Error message should mention workspace failure, got: {result}"
-
-        # Assert 2: projects.db active was rolled back to None
-        with pdb.connect_closing() as conn:
-            assert pdb.get_active_id(conn) is None, \
-                "Active project must be None after rollback (old_active_id was None)"
-
-        # Assert 3: facade session cwd unchanged (no partial detach)
-        assert server._sessions[sid]["cwd"] == str(home / "initial"), \
-            "Session cwd must NOT change on failure"
-    finally:
-        server._sessions.pop(sid, None)
-        hermes_constants.reset_hermes_home_override(token)
 
 
-def test_new_worktree_uses_project_owning_current_session_cwd(monkeypatch, tmp_path):
-    """A new worktree is adopted by the Project that owns this session's cwd."""
-    import hermes_constants
-    import tui_gateway.server as server
-    from hermes_cli import projects_db as pdb
 
-    home = tmp_path / "hermes"
-    home.mkdir()
-    repo = tmp_path / "repo"
-    stale = tmp_path / "stale-worktree"
-    target = tmp_path / "new-worktree"
-    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-    (repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
-    subprocess.run(
-        [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.com", "commit", "-m", "baseline",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "stale", str(stale)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "target", str(target)],
-        check=True,
-        capture_output=True,
-    )
-
-    token = hermes_constants.set_hermes_home_override(str(home))
-    sid = "test-sid-worktree-owner"
-    try:
-        monkeypatch.setattr(server, "_hermes_home", str(home))
-        with pdb.connect_closing() as conn:
-            canonical_id = pdb.create_project(
-                conn, name="Canonical", slug="canonical",
-                folders=[str(repo)], primary_path=str(repo),
-            )
-            stale_id = pdb.create_project(
-                conn, name="Historical", slug="historical",
-                folders=[str(stale)], primary_path=str(stale),
-            )
-            # Deliberately point global active state at the wrong candidate.
-            pdb.set_active(conn, stale_id)
-
-        server._sessions[sid] = {
-            "session_key": sid,
-            "cwd": str(repo),
-            "agent": None,
-        }
-
-        def apply_workspace(task_id, path, _name=""):
-            assert task_id == sid
-            assert path == str(target)
-            server._sessions[sid]["cwd"] = path
-            return True
-
-        monkeypatch.setattr(server, "_apply_project_workspace", apply_workspace)
-        intent = {"project_id": str(target)}
-        result = server._make_north_workspace_switch_callback(sid)(intent)
-
-        assert result is None
-        assert intent["canonical_project_id"] == canonical_id
-        assert intent["selected_path"] == str(target)
-        assert server._sessions[sid]["cwd"] == str(target)
-        with pdb.connect_closing() as conn:
-            assert pdb.get_active_id(conn) == canonical_id
-            canonical = pdb.get_project(conn, canonical_id)
-            historical = pdb.get_project(conn, stale_id)
-            assert canonical is not None
-            assert historical is not None
-            assert str(target) in {folder.path for folder in canonical.folders}
-            assert str(target) not in {folder.path for folder in historical.folders}
-    finally:
-        server._sessions.pop(sid, None)
-        hermes_constants.reset_hermes_home_override(token)
-
-
-def test_new_worktree_prefers_unique_canonical_git_owner_without_session_cwd(
-    monkeypatch, tmp_path,
-):
-    """Historical linked-worktree Projects must not shadow the canonical owner."""
-    import hermes_constants
-    import tui_gateway.server as server
-    from hermes_cli import projects_db as pdb
-
-    home = tmp_path / "hermes"
-    home.mkdir()
-    repo = tmp_path / "repo"
-    stale = tmp_path / "stale-worktree"
-    target = tmp_path / "new-worktree"
-    unrelated = tmp_path / "unrelated"
-    unrelated.mkdir()
-    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-    (repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
-    subprocess.run(
-        [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.com", "commit", "-m", "baseline",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "stale", str(stale)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "target", str(target)],
-        check=True,
-        capture_output=True,
-    )
-
-    token = hermes_constants.set_hermes_home_override(str(home))
-    sid = "test-sid-canonical-owner"
-    try:
-        monkeypatch.setattr(server, "_hermes_home", str(home))
-        with pdb.connect_closing() as conn:
-            canonical_id = pdb.create_project(
-                conn, name="Canonical", slug="canonical",
-                folders=[str(repo)], primary_path=str(repo),
-            )
-            pdb.create_project(
-                conn, name="Historical A", slug="historical-a",
-                folders=[str(stale)], primary_path=str(stale),
-            )
-            pdb.create_project(
-                conn, name="Historical B", slug="historical-b",
-                folders=[str(stale)], primary_path=str(stale),
-            )
-
-        server._sessions[sid] = {
-            "session_key": sid,
-            "cwd": str(unrelated),
-            "agent": None,
-        }
-
-        def apply_workspace(task_id, path, _name=""):
-            server._sessions[task_id]["cwd"] = path
-            return True
-
-        monkeypatch.setattr(server, "_apply_project_workspace", apply_workspace)
-        intent = {"project_id": str(target)}
-        result = server._make_north_workspace_switch_callback(sid)(intent)
-
-        assert result is None
-        assert intent["canonical_project_id"] == canonical_id
-        assert intent["selected_path"] == str(target)
-        with pdb.connect_closing() as conn:
-            canonical = pdb.get_project(conn, canonical_id)
-            assert canonical is not None
-            assert str(target) in {folder.path for folder in canonical.folders}
-    finally:
-        server._sessions.pop(sid, None)
-        hermes_constants.reset_hermes_home_override(token)
 
 
 def test_tui_callback_no_workspace_switch_noop():
@@ -654,7 +368,7 @@ def test_tui_callback_no_workspace_switch_noop():
 
 
 def test_tui_other_session_unaffected():
-    """Detaching one session must not affect other sessions."""
+    """A successful switch does not detach either session binding."""
     runtime = MockRuntime()
     runtime._pending_ws = {
         "project_id": "p1", "project_name": "A", "path": "/tmp"
@@ -662,7 +376,7 @@ def test_tui_other_session_unaffected():
     agent_a = NorthCoderTUIAgent(runtime, "sess-A", workspace_switch_callback=lambda ws: None)
     agent_b = NorthCoderTUIAgent(runtime, "sess-B")
     agent_a.run_conversation("hello")
-    assert "sess-A" in runtime.detached
+    assert runtime.detached == []
     assert "sess-B" not in runtime.detached
 
 

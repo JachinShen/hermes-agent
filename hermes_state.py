@@ -2373,6 +2373,45 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def update_session_git_metadata_if_cwd_matches(
+        self,
+        session_id: str,
+        expected_cwd: str,
+        git_branch: str = None,
+        git_repo_root: str = None,
+    ) -> bool:
+        """CAS-update git metadata without ever rewriting the session cwd.
+
+        Git probes run asynchronously, so their result may arrive after a newer
+        workspace switch.  Only enrich the row when its cwd is still the cwd
+        observed by the probe; a stale probe is a harmless no-op.
+        """
+        if not session_id or not expected_cwd:
+            return False
+        branch = (git_branch or "").strip()
+        repo_root = (git_repo_root or "").strip()
+        sets = []
+        params: List[Any] = []
+        if branch:
+            sets.append("git_branch = ?")
+            params.append(branch)
+        if repo_root:
+            sets.append("git_repo_root = ?")
+            params.append(repo_root)
+        if not sets:
+            return False
+        params.extend([session_id, expected_cwd])
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE sessions SET {', '.join(sets)} "
+                "WHERE id = ? AND cwd = ?",
+                params,
+            )
+            return cursor.rowcount
+
+        return bool(self._execute_write(_do))
+
     def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
 
