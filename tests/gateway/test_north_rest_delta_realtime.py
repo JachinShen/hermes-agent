@@ -815,6 +815,42 @@ async def test_rest_child_lineage_keeps_parallel_same_role_children_independent(
     ]
 
 
+@pytest.mark.asyncio
+async def test_rest_cancelled_root_closes_observed_child_lineage_once():
+    runtime = _runtime_for_rest_projection()
+    blocks = _north_04_child_lineage_blocks()[:-1]
+    blocks[-1].pop("metadata")
+    blocks[-1]["content"] = "last observed progress"
+    result = {"status": "cancelled", "blocks": blocks}
+    callbacks: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    emitted = await runtime._emit_rest_subagent_events(result, callbacks.append, seen)
+
+    assert [event["type"] for event in emitted] == [
+        "subagent_start", "subagent_progress", "subagent_end",
+    ]
+    assert emitted[-1] == {
+        "type": "subagent_end", "agentId": "rest-child:call-a", "agentName": "explore",
+        "parentToolCallId": "call-a", "status": "cancelled", "result": "last observed progress",
+    }
+    assert emitted[1]["lastToolName"] == "read_file"
+    assert emitted[1]["completedToolCalls"] == 1
+    await runtime._emit_rest_subagent_events(result, callbacks.append, seen)
+    assert callbacks == emitted, "cancelled child end must be emitted exactly once"
+
+
+@pytest.mark.asyncio
+async def test_rest_cancelled_root_keeps_completed_child_completed():
+    runtime = _runtime_for_rest_projection()
+    result = {"status": "cancelled", "blocks": _north_04_child_lineage_blocks()}
+
+    emitted = await runtime._emit_rest_subagent_events(result, None, set())
+
+    child_end = next(event for event in emitted if event["type"] == "subagent_end")
+    assert child_end["status"] == "completed"
+
+
 def test_rest_child_blocks_are_hidden_from_root_process_and_result_extractors():
     runtime = _runtime_for_rest_projection()
     blocks = [

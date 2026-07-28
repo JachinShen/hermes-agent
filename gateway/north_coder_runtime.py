@@ -263,7 +263,10 @@ class NorthCoderRuntime:
                     "metadata": payload["metadata"],
                     "conversation_options": {
                         "title": f"Hermes {session_key[-80:]}",
-                        "agent_config": {"agent_profile_id": self.config.agent_profile_id},
+                        "agent_config": {
+                            "agent_profile_id": self.config.agent_profile_id,
+                            "inherit_root_model_for_subagents": True,
+                        },
                     },
                 }
                 if effective_workdir:
@@ -1155,6 +1158,7 @@ class NorthCoderRuntime:
             if metadata.get("subagentStatus") == "done" or block_type == "subagent_anchor":
                 group["done"] = True
         emitted: list[dict[str, Any]] = []
+        root_status = str(result.get("status") or "").lower()
         for parent, group in groups.items():
             agent_id = f"rest-child:{parent}"
             role = str(group["role"])
@@ -1190,9 +1194,10 @@ class NorthCoderRuntime:
                     result_callback = on_event(event)
                     if asyncio.iscoroutine(result_callback):
                         await result_callback
-            if group["done"]:
+            if group["done"] or root_status in {"cancelled", "canceled"}:
+                child_status = "completed" if group["done"] else "cancelled"
                 event = {"type": "subagent_end", "agentId": agent_id, "agentName": role,
-                         "parentToolCallId": parent, "status": "completed", "result": group["last_text"]}
+                         "parentToolCallId": parent, "status": child_status, "result": group["last_text"]}
                 emitted.append(event)
                 key = self._lifecycle_key(event)
                 if key not in seen:
