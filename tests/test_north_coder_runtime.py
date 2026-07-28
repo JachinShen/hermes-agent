@@ -199,6 +199,7 @@ def test_north_tui_agent_public_seam_preserves_native_subagent_visibility_and_hi
     assert progress[0][0][2] == "inspect files"
     assert progress[1][0][1] == "read_file"
     assert progress[1][1]["tool_count"] == 1
+    assert progress[1][1]["parent_id"] == "root-run"
     assert progress[1][0][2] == "read_file"
     assert progress[2][1]["tool_count"] == 1
     assert progress[3][0][1] == "explore"
@@ -291,7 +292,13 @@ async def test_consume_events_maps_native_subagents_without_top_level_noise():
                 Item({"type": "thinking", "fragment": "child secret", "parentRunId": "run-child", "rootRunId": "run-root"}),
                 Item({"type": "tool_call_start", "toolCallId": "child-1", "toolCallName": "read_file", "runId": "a1", "agentId": "explore", "parentRunId": "run-root", "rootRunId": "run-root"}),
                 Item({"type": "subagent_progress", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "completedToolCalls": 1, "activeToolCalls": 0}),
-                Item({"type": "subagent_end", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "status": "completed", "result": "child secret"}),
+                Item({"type": "subagent_end", "agentId": "a1", "agentName": "explore", "status": "completed", "result": "child secret"}),
+                Item({"type": "subagent_start", "agentId": "a2", "agentName": "worker", "parentRunId": "root-run", "parentToolCallId": "root-agent-2", "query": "second"}),
+                # Tool call IDs are child-local; concurrent children may both
+                # legitimately emit the same ID.
+                Item({"type": "tool_call_start", "runId": "a2", "parentRunId": "root-run", "agentId": "worker", "toolCallId": "child-1", "toolCallName": "list_directory"}),
+                Item({"type": "subagent_end", "agentId": "a2", "agentName": "worker", "status": "completed", "result": "second secret"}),
+                # North also projects the root Agent(...) control tool; Hermes must not
                 Item({"type": "tool_call_start", "toolCallId": "agent-1", "toolCallName": "Agent"}),
                 Item({"type": "tool_call_args", "toolCallId": "agent-1"}),
                 Item({"type": "tool_call_end", "toolCallId": "agent-1"}),
@@ -319,18 +326,25 @@ async def test_consume_events_maps_native_subagents_without_top_level_noise():
     terminal = await runtime._consume_events(
         FakeWS(), response, deltas.append, callbacks.append, lifecycle_seen=lifecycle_seen,
     )
-    assert [event["type"] for event in callbacks if event["type"] in {
-        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
-    }] == [
-        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
+    callback_types = [event["type"] for event in callbacks if event["type"] in {
+        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end",
+        "tool_call_start", "tool_call_result",
+    }]
+    assert callback_types == [
+        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end",
+        "subagent_start", "subagent_tool", "subagent_end",
+        "tool_call_start", "tool_call_result",
     ]
-    child_tool = next(event for event in callbacks if event["type"] == "subagent_tool")
+    child_tools = [event for event in callbacks if event["type"] == "subagent_tool"]
+    assert len(child_tools) == 2
+    child_tool = child_tools[0]
     assert child_tool["agentId"] == "a1"
-    assert child_tool["agentName"] == "explore"
-    assert child_tool["toolCallId"] == "child-1"
     assert child_tool["toolCallName"] == "read_file"
     assert child_tool["parentToolCallId"] == "root-agent"
+    assert child_tools[1]["agentId"] == "a2"
+    assert child_tools[1]["parentToolCallId"] == "root-agent-2"
     assert ("subagent_tool", "root-agent", "child-1") in lifecycle_seen
+    assert ("subagent_tool", "root-agent-2", "child-1") in lifecycle_seen
     assert ("subagent_end", "root-agent") in lifecycle_seen
     assert terminal["subagents"][0]["agentName"] == "explore"
     ended = next(event for event in terminal["subagents"] if event["type"] == "subagent_end")

@@ -911,7 +911,7 @@ class NorthCoderRuntime:
         replaying = False
         terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
         agent_control_call_ids: set[str] = set()
-        child_tool_call_ids: set[str] = set()
+        child_tool_call_ids: set[tuple[str, str]] = set()
         subagent_parent_tool_ids: dict[str, str] = {}
         while True:
             try:
@@ -970,23 +970,27 @@ class NorthCoderRuntime:
                 if kind != "tool_call_start":
                     continue
                 call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
-                if call_id and call_id in child_tool_call_ids:
-                    continue
-                if call_id:
-                    child_tool_call_ids.add(call_id)
                 child_agent_name = str(event.get("agentId") or event.get("agent_id") or "worker")
                 child_run_id = str(event.get("runId") or event.get("run_id") or child_agent_name)
+                parent_tool_id = str(
+                    subagent_parent_tool_ids.get(child_run_id)
+                    or event.get("parentToolCallId")
+                    or event.get("parent_tool_call_id")
+                    or ""
+                )
+                # North tool-call IDs are scoped to a child run. Never let a
+                # sibling child using the same local ID suppress this event.
+                child_tool_key = (parent_tool_id or child_run_id, call_id)
+                if call_id and child_tool_key in child_tool_call_ids:
+                    continue
+                if call_id:
+                    child_tool_call_ids.add(child_tool_key)
                 event = {
                     **event,
                     "type": "subagent_tool",
                     "agentId": child_run_id,
                     "agentName": child_agent_name,
-                    "parentToolCallId": (
-                        subagent_parent_tool_ids.get(child_run_id)
-                        or event.get("parentToolCallId")
-                        or event.get("parent_tool_call_id")
-                        or ""
-                    ),
+                    "parentToolCallId": parent_tool_id,
                 }
                 kind = "subagent_tool"
             if kind in {"subagent_start", "subagent_tool", "subagent_progress", "subagent_end"}:
@@ -1716,7 +1720,8 @@ class NorthCoderTUIAgent:
                         subagent_tool_counts[subagent_id] = count
                         tool_progress_callback(
                             "subagent.tool", tool_name, tool_name, event,
-                            subagent_id=subagent_id, tool_count=count,
+                            subagent_id=subagent_id, parent_id=parent_id,
+                            tool_count=count,
                         )
                 elif kind == "subagent_progress":
                     if tool_progress_callback:
