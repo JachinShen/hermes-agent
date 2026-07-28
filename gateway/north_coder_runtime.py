@@ -186,6 +186,9 @@ class NorthCoderRuntime:
         import aiohttp
 
         requested_workspace_id = str(workspace_id or "").strip() or None
+        # Lifecycle dedupe is deliberately scoped to this turn: WS and REST
+        # may both expose the same child, but a later turn must not inherit it.
+        lifecycle_seen: set[tuple[Any, ...]] = set()
         # A caller-selected North workspace and an arbitrary filesystem workdir
         # are mutually exclusive routing modes. Gateway defaults select the
         # former; TUI/project sessions select the latter.
@@ -364,6 +367,7 @@ class NorthCoderRuntime:
                         on_event,
                         process_replay=composite_run,
                         stream_text=not bool(invocation_id and self.config.tui_variant),
+                        lifecycle_seen=lifecycle_seen,
                     )
                 )
                 if invocation_id:
@@ -374,21 +378,24 @@ class NorthCoderRuntime:
                     #   - WS先terminal时，仍等待REST reconcile（不立即cancel poll）
                     #   - 双方都永久running时，_poll_result的timeout_seconds硬deadline触发
                     poll_task = asyncio.ensure_future(
-                        self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta)
+                        self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta, lifecycle_seen=lifecycle_seen)
                     )
                     # 等待最先完成的一方
                     done, pending = await asyncio.wait(
                         [ws_task, poll_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    # REST先terminal → 取消WS
+                    # REST is authoritative.  Child lifecycle comes from the
+                    # REST blocks scanner above; do not delay completion for WS
+                    # replay, which does not contain subagent_* events.
                     if poll_task in done and not poll_task.cancelled():
-                        ws_task.cancel()
-                        try:
-                            await ws_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
                         await ws.close()
+                        if ws_task in pending:
+                            ws_task.cancel()
+                            try:
+                                await ws_task
+                            except asyncio.CancelledError:
+                                pass
 
                         try:
                             authoritative = poll_task.result()
@@ -484,7 +491,7 @@ class NorthCoderRuntime:
                         terminal["status"] = "failed"
                         terminal.setdefault("error", terminal["transport_error"])
             elif invocation_id:
-                terminal = await self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta)
+                terminal = await self._poll_result(client, invocation_id, full_response, on_event, on_delta=on_delta, lifecycle_seen=lifecycle_seen)
                 # REST-only path: extract tool_use blocks from raw result into tools
                 if terminal.get("blocks") and not terminal.get("tools"):
                     rest_tools = self._extract_result_tool_blocks(terminal)
@@ -842,6 +849,7 @@ class NorthCoderRuntime:
 
         conversation_id = await self._conversation_id(session_key)
         full_response: list[str] = []
+        lifecycle_seen: set[tuple[Any, ...]] = set()
         terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds, sock_read=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as client:
@@ -856,11 +864,11 @@ class NorthCoderRuntime:
             resumed_id = str(accepted.get("invocation_id") or invocation_id)
             if ws is not None:
                 try:
-                    terminal = await self._consume_events(ws, full_response, on_delta, on_event)
+                    terminal = await self._consume_events(ws, full_response, on_delta, on_event, lifecycle_seen=lifecycle_seen)
                 finally:
                     await ws.close()
             else:
-                terminal = await self._poll_result(client, resumed_id, full_response, on_event, on_delta=on_delta)
+                terminal = await self._poll_result(client, resumed_id, full_response, on_event, on_delta=on_delta, lifecycle_seen=lifecycle_seen)
         text = "".join(full_response)
         status = str(terminal.get("status") or "completed")
         return {
@@ -897,7 +905,9 @@ class NorthCoderRuntime:
         *,
         process_replay: bool = False,
         stream_text: bool = True,
+        lifecycle_seen: Optional[set[tuple[Any, ...]]] = None,
     ) -> dict[str, Any]:
+        lifecycle_seen = lifecycle_seen if lifecycle_seen is not None else set()
         replaying = False
         terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
         agent_control_call_ids: set[str] = set()
@@ -940,6 +950,10 @@ class NorthCoderRuntime:
             if parent_run_id and kind not in {"subagent_start", "subagent_progress", "subagent_end"}:
                 continue
             if kind in {"subagent_start", "subagent_progress", "subagent_end"}:
+                lifecycle_key = self._lifecycle_key(event)
+                if lifecycle_key in lifecycle_seen:
+                    continue
+                lifecycle_seen.add(lifecycle_key)
                 terminal.setdefault("subagents", []).append(event)
             if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
                 parent_run_id = event.get("parentRunId") or event.get("parent_run_id")
@@ -1025,6 +1039,7 @@ class NorthCoderRuntime:
             for block in blocks
             if isinstance(block, dict)
             and str(block.get("block_type") or block.get("type") or "") == "tool_use"
+            and not any(block.get(k) for k in ("parent_agent_id", "parentAgentId", "parent_tool_call_id", "parentToolCallId"))
         ]
 
     @staticmethod
@@ -1041,6 +1056,8 @@ class NorthCoderRuntime:
                 continue
             role = str(block.get("role") or "")
             block_type = str(block.get("block_type") or block.get("type") or "")
+            if any(block.get(k) for k in ("parent_agent_id", "parentAgentId", "parent_tool_call_id", "parentToolCallId")):
+                continue
             content = block.get("content") or block.get("text")
             if role == "assistant" and block_type == "text" and isinstance(content, str):
                 parts.append(content)
@@ -1058,6 +1075,8 @@ class NorthCoderRuntime:
                 continue
             role = str(block.get("role") or "")
             block_type = str(block.get("block_type") or block.get("type") or "")
+            if any(block.get(k) for k in ("parent_agent_id", "parentAgentId", "parent_tool_call_id", "parentToolCallId")):
+                continue
             if role != "assistant" or block_type != "text":
                 continue
             # A text block followed by another assistant action is progress
@@ -1073,6 +1092,116 @@ class NorthCoderRuntime:
                 content = block.get("content") or block.get("text")
                 return content if isinstance(content, str) else ""
         return ""
+
+    @staticmethod
+    def _lifecycle_key(event: dict[str, Any]) -> tuple[Any, ...]:
+        """Stable per-child identity shared by WS and REST projections."""
+        kind = str(event.get("type") or "")
+        parent = str(event.get("parentToolCallId") or event.get("parent_tool_call_id") or "")
+        agent = str(event.get("agentId") or event.get("agent_id") or "")
+        boundary = parent or agent
+        if kind == "subagent_progress":
+            return (kind, boundary, str(event.get("lastToolName") or event.get("last_tool_name") or ""),
+                    int(event.get("completedToolCalls") or event.get("completed_tool_calls") or 0),
+                    int(event.get("activeToolCalls") or event.get("active_tool_calls") or 0))
+        return (kind, boundary)
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    async def _emit_rest_subagent_events(
+        self, result: dict[str, Any], on_event: Optional[EventCallback],
+        seen: set[tuple[Any, ...]],
+    ) -> list[dict[str, Any]]:
+        """Project authoritative North 0.4 REST blocks onto child events."""
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return []
+        roots: dict[str, dict[str, Any]] = {}
+        for block in blocks:
+            if not isinstance(block, dict) or str(block.get("block_type") or block.get("type") or "") != "tool_use":
+                continue
+            if any(block.get(k) for k in ("parent_agent_id", "parentAgentId", "parent_tool_call_id", "parentToolCallId")):
+                continue
+            payload = self._json_object(block.get("content"))
+            if payload.get("name") == "Agent":
+                call_id = str(payload.get("id") or block.get("id") or block.get("tool_call_id") or "")
+                if call_id:
+                    roots[call_id] = payload
+        groups: dict[str, dict[str, Any]] = {}
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+            parent = str(block.get("parent_tool_call_id") or block.get("parentToolCallId") or "")
+            role = str(block.get("parent_agent_id") or block.get("parentAgentId") or "")
+            if not parent or not role:
+                continue
+            group = groups.setdefault(parent, {"role": role, "blocks": [], "last_text": "", "done": False})
+            group["blocks"].append((index, block))
+            block_type = str(block.get("block_type") or block.get("type") or "")
+            content = block.get("content") or block.get("text")
+            if block_type == "text" and isinstance(content, str) and content:
+                group["last_text"] = content
+            metadata = self._json_object(block.get("metadata"))
+            if metadata.get("subagentStatus") == "done" or block_type == "subagent_anchor":
+                group["done"] = True
+        emitted: list[dict[str, Any]] = []
+        for parent, group in groups.items():
+            agent_id = f"rest-child:{parent}"
+            role = str(group["role"])
+            root = roots.get(parent, {})
+            root_input: dict[str, Any] = dict(root["input"]) if isinstance(root.get("input"), dict) else {}
+            start = {"type": "subagent_start", "agentId": agent_id, "agentName": role,
+                     "parentToolCallId": parent, "query": str(root_input.get("message") or "")}
+            for event in (start,):
+                emitted.append(event)
+                key = self._lifecycle_key(event)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if on_event:
+                    result_callback = on_event(event)
+                    if asyncio.iscoroutine(result_callback):
+                        await result_callback
+            completed = 0
+            for _, block in group["blocks"]:
+                if str(block.get("block_type") or block.get("type") or "") != "tool_use":
+                    continue
+                payload = self._json_object(block.get("content"))
+                event = {"type": "subagent_progress", "agentId": agent_id, "agentName": role,
+                         "parentToolCallId": parent, "lastToolName": str(payload.get("name") or block.get("name") or ""),
+                         "completedToolCalls": completed + 1, "activeToolCalls": 0}
+                completed += 1
+                emitted.append(event)
+                key = self._lifecycle_key(event)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if on_event:
+                    result_callback = on_event(event)
+                    if asyncio.iscoroutine(result_callback):
+                        await result_callback
+            if group["done"]:
+                event = {"type": "subagent_end", "agentId": agent_id, "agentName": role,
+                         "parentToolCallId": parent, "status": "completed", "result": group["last_text"]}
+                emitted.append(event)
+                key = self._lifecycle_key(event)
+                if key not in seen:
+                    seen.add(key)
+                    if on_event:
+                        result_callback = on_event(event)
+                        if asyncio.iscoroutine(result_callback):
+                            await result_callback
+        return emitted
 
     async def _emit_rest_process_events(
         self,
@@ -1091,6 +1220,8 @@ class NorthCoderRuntime:
                 continue
             role = str(block.get("role") or "")
             block_type = str(block.get("block_type") or block.get("type") or "")
+            if any(block.get(k) for k in ("parent_agent_id", "parentAgentId", "parent_tool_call_id", "parentToolCallId")):
+                continue
             position = str(block.get("position") if block.get("position") is not None else index)
             key = (position, block_type)
             if key in seen or role != "assistant":
@@ -1149,9 +1280,12 @@ class NorthCoderRuntime:
             if asyncio.iscoroutine(callback_result):
                 await callback_result
 
-    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback], *, on_delta: Optional[DeltaCallback] = None) -> dict[str, Any]:
+    async def _poll_result(self, client: Any, invocation_id: str, full_response: list[str], on_event: Optional[EventCallback], *, on_delta: Optional[DeltaCallback] = None, lifecycle_seen: Optional[set[tuple[Any, ...]]] = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.timeout_seconds
         seen_process_events: set[tuple[str, str]] = set()
+        lifecycle_seen = lifecycle_seen if lifecycle_seen is not None else set()
+        rest_subagents: list[dict[str, Any]] = []
+        rest_record_keys: set[tuple[Any, ...]] = set()
         while time.monotonic() < deadline:
             async with client.get(f"{self.config.base_url}/api/invocations/{invocation_id}/result") as response:
                 if response.status >= 400:
@@ -1162,6 +1296,11 @@ class NorthCoderRuntime:
                 callback_result = on_event(event)
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
+            for subagent_event in await self._emit_rest_subagent_events(result, on_event, lifecycle_seen):
+                record_key = self._lifecycle_key(subagent_event)
+                if record_key not in rest_record_keys:
+                    rest_record_keys.add(record_key)
+                    rest_subagents.append(subagent_event)
             if self.config.tui_variant:
                 await self._emit_rest_process_events(result, on_event, seen_process_events)
             text = (
@@ -1195,6 +1334,8 @@ class NorthCoderRuntime:
                 if questions and not required_action.get("questions"):
                     required_action = {**required_action, "questions": questions}
                     result["required_action"] = required_action
+            if rest_subagents:
+                result["subagents"] = rest_subagents
             if status in {"completed", "requires_action", "failed", "cancelled", "error"} or result.get("finished"):
                 if status not in {"completed", ""}:
                     return result

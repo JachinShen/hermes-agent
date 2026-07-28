@@ -703,3 +703,171 @@ async def test_gateway_direct_unsupported_project_switch_tool_use(
         )
     finally:
         monkeypatch.undo()
+
+
+# ======================================================================
+# Seam C: REST child lineage fallback — North 0.4 result block shape
+
+
+def _north_04_child_lineage_blocks(*, second_parent: str | None = None) -> list[dict[str, Any]]:
+    """Build the persisted 0.4 shape, including the root Agent control block."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "block_type": "tool_use",
+            "content": json.dumps({
+                "id": "call-a",
+                "input": {"message": "inspect", "sub_agent_name": "explore"},
+                "name": "Agent",
+            }),
+        },
+        {
+            "role": "assistant",
+            "block_type": "tool_use",
+            "parent_agent_id": "explore",
+            "parent_tool_call_id": "call-a",
+            "content": json.dumps({"id": "child-tool", "name": "read_file", "input": {"path": "README"}}),
+        },
+        {
+            "role": "tool",
+            "block_type": "tool_result",
+            "parent_agent_id": "explore",
+            "parent_tool_call_id": "call-a",
+            "content": json.dumps({"toolUseId": "child-tool", "content": "ok"}),
+        },
+        {
+            "role": "assistant",
+            "block_type": "text",
+            "parent_agent_id": "explore",
+            "parent_tool_call_id": "call-a",
+            "content": "inspection complete",
+            "metadata": json.dumps({"subagentStatus": "done"}),
+        },
+        {
+            "role": "assistant",
+            "block_type": "subagent_anchor",
+            "parent_agent_id": "explore",
+            "parent_tool_call_id": "call-a",
+        },
+    ]
+    if second_parent is not None:
+        blocks.extend([
+            {
+                "role": "assistant",
+                "block_type": "tool_use",
+                "parent_agent_id": "explore",
+                "parent_tool_call_id": second_parent,
+                "content": json.dumps({"id": f"child-{second_parent}", "name": "read_file", "input": {}}),
+            },
+            {
+                "role": "assistant",
+                "block_type": "text",
+                "parent_agent_id": "explore",
+                "parent_tool_call_id": second_parent,
+                "content": f"summary-{second_parent}",
+                "metadata": json.dumps({"subagentStatus": "done"}),
+            },
+        ])
+    return blocks
+
+
+def _runtime_for_rest_projection() -> NorthCoderRuntime:
+    return NorthCoderRuntime(
+        NorthCoderRuntimeConfig(base_url="http://0.0.0.0:1", timeout_seconds=0.1),
+        Path("/tmp"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_child_lineage_projects_exact_north_04_lifecycle_and_dedupes():
+    runtime = _runtime_for_rest_projection()
+    result = {"status": "completed", "blocks": _north_04_child_lineage_blocks()}
+    callbacks: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    emitted = await runtime._emit_rest_subagent_events(result, callbacks.append, seen)
+    assert emitted == [
+        {"type": "subagent_start", "agentId": "rest-child:call-a", "agentName": "explore",
+         "parentToolCallId": "call-a", "query": "inspect"},
+        {"type": "subagent_progress", "agentId": "rest-child:call-a", "agentName": "explore",
+         "parentToolCallId": "call-a", "lastToolName": "read_file", "completedToolCalls": 1, "activeToolCalls": 0},
+        {"type": "subagent_end", "agentId": "rest-child:call-a", "agentName": "explore",
+         "parentToolCallId": "call-a", "status": "completed", "result": "inspection complete"},
+    ]
+    assert callbacks == emitted
+    assert await runtime._emit_rest_subagent_events(result, callbacks.append, seen) == emitted
+    assert callbacks == emitted, "重复 REST result 不得重复 callback"
+
+
+@pytest.mark.asyncio
+async def test_rest_child_lineage_keeps_parallel_same_role_children_independent():
+    runtime = _runtime_for_rest_projection()
+    result = {"status": "completed", "blocks": _north_04_child_lineage_blocks(second_parent="call-b")}
+    callbacks: list[dict[str, Any]] = []
+    await runtime._emit_rest_subagent_events(result, callbacks.append, set())
+
+    lifecycle = [event for event in callbacks if event["type"] in {"subagent_start", "subagent_end"}]
+    assert [(event["type"], event["agentId"], event["parentToolCallId"]) for event in lifecycle] == [
+        ("subagent_start", "rest-child:call-a", "call-a"),
+        ("subagent_end", "rest-child:call-a", "call-a"),
+        ("subagent_start", "rest-child:call-b", "call-b"),
+        ("subagent_end", "rest-child:call-b", "call-b"),
+    ]
+
+
+def test_rest_child_blocks_are_hidden_from_root_process_and_result_extractors():
+    runtime = _runtime_for_rest_projection()
+    blocks = [
+        {"position": 1, "role": "assistant", "block_type": "text", "content": "root process"},
+        *_north_04_child_lineage_blocks(),
+        {"position": 10, "role": "assistant", "block_type": "tool_use",
+         "content": json.dumps({"id": "root-tool", "name": "read_file", "input": {}})},
+        {"position": 11, "role": "assistant", "block_type": "text", "content": "root final"},
+    ]
+    result = {"blocks": blocks}
+    assert [json.loads(block["content"])["id"] for block in runtime._extract_result_tool_blocks(result)] == [
+        "call-a", "root-tool",
+    ]
+    assert runtime._extract_result_text(result) == "root processroot final"
+    assert runtime._extract_final_result_text(result) == "root final"
+
+
+@pytest.mark.asyncio
+async def test_rest_process_projection_keeps_root_agent_but_emits_no_child_tool_lifecycle():
+    runtime = _runtime_for_rest_projection()
+    callbacks: list[dict[str, Any]] = []
+    await runtime._emit_rest_process_events(
+        {"blocks": _north_04_child_lineage_blocks()}, callbacks.append, set()
+    )
+    assert [event["type"] for event in callbacks] == ["tool_call_start"]
+    assert callbacks[0]["toolCallName"] == "Agent"
+
+
+@pytest.mark.asyncio
+async def test_rest_child_lifecycle_shares_boundary_dedupe_with_live_events():
+    runtime = _runtime_for_rest_projection()
+    callbacks: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    await runtime._emit_rest_subagent_events(
+        {"blocks": _north_04_child_lineage_blocks()}, callbacks.append, seen
+    )
+    live_start = {"type": "subagent_start", "agentId": "live-child", "parentToolCallId": "call-a"}
+    live_end = {"type": "subagent_end", "agentId": "live-child", "parentToolCallId": "call-a"}
+    assert runtime._lifecycle_key(live_start) == runtime._lifecycle_key(callbacks[0])
+    assert runtime._lifecycle_key(live_end) == runtime._lifecycle_key(callbacks[-1])
+    callback_count = len(callbacks)
+    for event in (live_start, live_end):
+        if runtime._lifecycle_key(event) not in seen:
+            callbacks.append(event)
+    assert len(callbacks) == callback_count, "shared lifecycle seen must suppress live boundary duplicates"
+
+
+@pytest.mark.asyncio
+async def test_rest_child_lineage_without_child_blocks_emits_nothing():
+    runtime = _runtime_for_rest_projection()
+    callbacks: list[dict[str, Any]] = []
+    assert await runtime._emit_rest_subagent_events(
+        {"blocks": [{"role": "assistant", "block_type": "text", "content": "root only"}]},
+        callbacks.append, set(),
+    ) == []
+    assert callbacks == []
