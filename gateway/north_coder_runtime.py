@@ -911,6 +911,8 @@ class NorthCoderRuntime:
         replaying = False
         terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
         agent_control_call_ids: set[str] = set()
+        child_tool_call_ids: set[str] = set()
+        subagent_parent_tool_ids: dict[str, str] = {}
         while True:
             try:
                 item = await asyncio.wait_for(
@@ -945,16 +947,55 @@ class NorthCoderRuntime:
                 replaying = False
             if kind in {"history_ref", "replay_start", "replay_end"} or (replaying and not process_replay):
                 continue
-            # Child raw fragments are projected onto the root stream by North;
-            # only the explicit subagent lifecycle is root-visible.
+            if kind == "subagent_start":
+                child_id = str(event.get("agentId") or event.get("agent_id") or "")
+                parent_tool_id = str(
+                    event.get("parentToolCallId") or event.get("parent_tool_call_id") or ""
+                )
+                if child_id and parent_tool_id:
+                    subagent_parent_tool_ids[child_id] = parent_tool_id
+            elif kind in {"subagent_progress", "subagent_end"}:
+                child_id = str(event.get("agentId") or event.get("agent_id") or "")
+                parent_tool_id = subagent_parent_tool_ids.get(child_id, "")
+                if parent_tool_id and not (
+                    event.get("parentToolCallId") or event.get("parent_tool_call_id")
+                ):
+                    event = {**event, "parentToolCallId": parent_tool_id}
+            # Child text/thinking/results must not leak into the root transcript.
+            # Tool starts are different: North emits them immediately and then
+            # emits aggregate subagent_progress. Preserve the concrete tool call
+            # as a dedicated child event so the TUI can render live progress even
+            # when the composite-run WS subscription missed SubagentProgress.
             if parent_run_id and kind not in {"subagent_start", "subagent_progress", "subagent_end"}:
-                continue
-            if kind in {"subagent_start", "subagent_progress", "subagent_end"}:
+                if kind != "tool_call_start":
+                    continue
+                call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                if call_id and call_id in child_tool_call_ids:
+                    continue
+                if call_id:
+                    child_tool_call_ids.add(call_id)
+                child_agent_name = str(event.get("agentId") or event.get("agent_id") or "worker")
+                child_run_id = str(event.get("runId") or event.get("run_id") or child_agent_name)
+                event = {
+                    **event,
+                    "type": "subagent_tool",
+                    "agentId": child_run_id,
+                    "agentName": child_agent_name,
+                    "parentToolCallId": (
+                        subagent_parent_tool_ids.get(child_run_id)
+                        or event.get("parentToolCallId")
+                        or event.get("parent_tool_call_id")
+                        or ""
+                    ),
+                }
+                kind = "subagent_tool"
+            if kind in {"subagent_start", "subagent_tool", "subagent_progress", "subagent_end"}:
                 lifecycle_key = self._lifecycle_key(event)
                 if lifecycle_key in lifecycle_seen:
                     continue
                 lifecycle_seen.add(lifecycle_key)
-                terminal.setdefault("subagents", []).append(event)
+                if kind != "subagent_tool":
+                    terminal.setdefault("subagents", []).append(event)
             if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
                 parent_run_id = event.get("parentRunId") or event.get("parent_run_id")
                 call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
@@ -1104,6 +1145,8 @@ class NorthCoderRuntime:
             return (kind, boundary, str(event.get("lastToolName") or event.get("last_tool_name") or ""),
                     int(event.get("completedToolCalls") or event.get("completed_tool_calls") or 0),
                     int(event.get("activeToolCalls") or event.get("active_tool_calls") or 0))
+        if kind == "subagent_tool":
+            return (kind, boundary, str(event.get("toolCallId") or event.get("tool_call_id") or ""))
         return (kind, boundary)
 
     @staticmethod
@@ -1178,9 +1221,12 @@ class NorthCoderRuntime:
                 if str(block.get("block_type") or block.get("type") or "") != "tool_use":
                     continue
                 payload = self._json_object(block.get("content"))
-                event = {"type": "subagent_progress", "agentId": agent_id, "agentName": role,
-                         "parentToolCallId": parent, "lastToolName": str(payload.get("name") or block.get("name") or ""),
-                         "completedToolCalls": completed + 1, "activeToolCalls": 0}
+                event = {"type": "subagent_tool", "agentId": agent_id, "agentName": role,
+                         "parentToolCallId": parent,
+                         "toolCallId": str(payload.get("id") or block.get("id") or block.get("tool_call_id") or f"{parent}:{completed}"),
+                         "toolCallName": str(payload.get("name") or block.get("name") or ""),
+                         "input": payload.get("input") or payload.get("args") or {},
+                         "toolCount": completed + 1}
                 completed += 1
                 emitted.append(event)
                 key = self._lifecycle_key(event)
@@ -1637,6 +1683,7 @@ class NorthCoderTUIAgent:
 
         tool_names: dict[str, Any] = {}
         agent_control_call_ids: set[str] = set()
+        subagent_tool_counts: dict[str, int] = {}
 
         def on_event(event: dict[str, Any]) -> None:
             kind = str(event.get("type") or "")
@@ -1645,7 +1692,7 @@ class NorthCoderTUIAgent:
                 if process_text and reasoning_callback:
                     reasoning_callback(process_text)
                 return
-            if kind in {"subagent_start", "subagent_progress", "subagent_end"}:
+            if kind in {"subagent_start", "subagent_tool", "subagent_progress", "subagent_end"}:
                 role = str(event.get("agentName") or event.get("agent_name") or "worker")
                 subagent_id = str(event.get("agentId") or event.get("agent_id") or "")
                 parent_id = str(
@@ -1661,13 +1708,23 @@ class NorthCoderTUIAgent:
                             goal=str(event.get("query") or event.get("prompt") or ""),
                             status="running", role=role,
                         )
+                elif kind == "subagent_tool":
+                    if tool_progress_callback:
+                        tool_name = str(event.get("toolCallName") or event.get("tool_name") or role)
+                        reported = int(event.get("toolCount") or event.get("tool_count") or 0)
+                        count = max(reported, subagent_tool_counts.get(subagent_id, 0) + 1)
+                        subagent_tool_counts[subagent_id] = count
+                        tool_progress_callback(
+                            "subagent.tool", tool_name, tool_name, event,
+                            subagent_id=subagent_id, tool_count=count,
+                        )
                 elif kind == "subagent_progress":
                     if tool_progress_callback:
                         completed = int(event.get("completedToolCalls") or event.get("completed_tool_calls") or 0)
                         active = int(event.get("activeToolCalls") or event.get("active_tool_calls") or 0)
                         last_tool = str(event.get("lastToolName") or event.get("last_tool_name") or role)
                         tool_progress_callback(
-                            "subagent.tool", last_tool,
+                            "subagent.progress", last_tool,
                             f"{last_tool} ({completed + active} tools)", event,
                             subagent_id=subagent_id, parent_id=parent_id,
                             tool_count=completed + active,

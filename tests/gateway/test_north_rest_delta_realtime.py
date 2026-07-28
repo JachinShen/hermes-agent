@@ -789,8 +789,9 @@ async def test_rest_child_lineage_projects_exact_north_04_lifecycle_and_dedupes(
     assert emitted == [
         {"type": "subagent_start", "agentId": "rest-child:call-a", "agentName": "explore",
          "parentToolCallId": "call-a", "query": "inspect"},
-        {"type": "subagent_progress", "agentId": "rest-child:call-a", "agentName": "explore",
-         "parentToolCallId": "call-a", "lastToolName": "read_file", "completedToolCalls": 1, "activeToolCalls": 0},
+        {"type": "subagent_tool", "agentId": "rest-child:call-a", "agentName": "explore",
+         "parentToolCallId": "call-a", "toolCallId": "child-tool", "toolCallName": "read_file",
+         "input": {"path": "README"}, "toolCount": 1},
         {"type": "subagent_end", "agentId": "rest-child:call-a", "agentName": "explore",
          "parentToolCallId": "call-a", "status": "completed", "result": "inspection complete"},
     ]
@@ -828,14 +829,14 @@ async def test_rest_cancelled_root_closes_observed_child_lineage_once():
     emitted = await runtime._emit_rest_subagent_events(result, callbacks.append, seen)
 
     assert [event["type"] for event in emitted] == [
-        "subagent_start", "subagent_progress", "subagent_end",
+        "subagent_start", "subagent_tool", "subagent_end",
     ]
     assert emitted[-1] == {
         "type": "subagent_end", "agentId": "rest-child:call-a", "agentName": "explore",
         "parentToolCallId": "call-a", "status": "cancelled", "result": "last observed progress",
     }
-    assert emitted[1]["lastToolName"] == "read_file"
-    assert emitted[1]["completedToolCalls"] == 1
+    assert emitted[1]["toolCallName"] == "read_file"
+    assert emitted[1]["toolCount"] == 1
     await runtime._emit_rest_subagent_events(result, callbacks.append, seen)
     assert callbacks == emitted, "cancelled child end must be emitted exactly once"
 

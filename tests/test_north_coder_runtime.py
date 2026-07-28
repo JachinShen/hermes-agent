@@ -158,7 +158,8 @@ def test_north_tui_agent_public_seam_preserves_native_subagent_visibility_and_hi
             emit = kwargs["on_event"]
             for event in (
                 {"type": "subagent_start", "agentId": "explore-1", "agentName": "explore", "query": "inspect files", "parentRunId": "root-run", "rootRunId": "root-run"},
-                {"type": "subagent_progress", "agentId": "explore-1", "agentName": "explore", "parentRunId": "root-run", "rootRunId": "root-run", "lastToolName": "read_file"},
+                {"type": "subagent_tool", "agentId": "explore-1", "agentName": "explore", "toolCallId": "child-1", "toolCallName": "read_file", "parentRunId": "root-run", "rootRunId": "root-run"},
+                {"type": "subagent_progress", "agentId": "explore-1", "agentName": "explore", "parentRunId": "root-run", "rootRunId": "root-run", "lastToolName": "read_file", "completedToolCalls": 1, "activeToolCalls": 0},
                 {"type": "subagent_end", "agentId": "explore-1", "agentName": "explore", "parentRunId": "root-run", "rootRunId": "root-run", "status": "completed", "result": "child secret"},
                 {"type": "tool_call_start", "toolCallId": "agent-1", "toolCallName": "Agent", "args": {"query": "inspect files"}},
                 {"type": "tool_call_args", "toolCallId": "agent-1", "args": {"query": "inspect files"}},
@@ -187,7 +188,7 @@ def test_north_tui_agent_public_seam_preserves_native_subagent_visibility_and_hi
         ("start", "root-1", "read_file"), ("complete", "root-1", "read_file"),
     ]
     assert [args[0] for args, _ in progress] == [
-        "subagent.start", "subagent.tool", "subagent.complete",
+        "subagent.start", "subagent.tool", "subagent.progress", "subagent.complete",
         "tool.started", "tool.completed",
     ]
     assert progress[0][0][1] == "explore"
@@ -197,13 +198,14 @@ def test_north_tui_agent_public_seam_preserves_native_subagent_visibility_and_hi
     assert progress[0][1]["status"] == "running"
     assert progress[0][0][2] == "inspect files"
     assert progress[1][0][1] == "read_file"
-    assert progress[1][1]["tool_count"] == 0
-    assert progress[1][0][2] == "read_file (0 tools)"
-    assert progress[2][0][1] == "explore"
-    assert progress[2][1]["subagent_id"] == "explore-1"
-    assert progress[2][1]["summary"] == "child secret"
-    assert progress[2][0][2] == "child secret"
-    assert progress[2][1]["status"] == "completed"
+    assert progress[1][1]["tool_count"] == 1
+    assert progress[1][0][2] == "read_file"
+    assert progress[2][1]["tool_count"] == 1
+    assert progress[3][0][1] == "explore"
+    assert progress[3][1]["subagent_id"] == "explore-1"
+    assert progress[3][1]["summary"] == "child secret"
+    assert progress[3][0][2] == "child secret"
+    assert progress[3][1]["status"] == "completed"
     assert all("child secret" not in str(message) for message in result["messages"])
 
 
@@ -287,7 +289,7 @@ async def test_consume_events_maps_native_subagents_without_top_level_noise():
                 Item({"type": "subagent_start", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "parentToolCallId": "root-agent"}),
                 Item({"type": "text_message_content", "delta": "child secret", "parentRunId": "run-child", "rootRunId": "run-root"}),
                 Item({"type": "thinking", "fragment": "child secret", "parentRunId": "run-child", "rootRunId": "run-root"}),
-                Item({"type": "tool_call_start", "toolCallId": "child-1", "toolCallName": "read_file", "parentRunId": "run-child", "rootRunId": "run-root"}),
+                Item({"type": "tool_call_start", "toolCallId": "child-1", "toolCallName": "read_file", "runId": "a1", "agentId": "explore", "parentRunId": "run-root", "rootRunId": "run-root"}),
                 Item({"type": "subagent_progress", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "completedToolCalls": 1, "activeToolCalls": 0}),
                 Item({"type": "subagent_end", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "status": "completed", "result": "child secret"}),
                 Item({"type": "tool_call_start", "toolCallId": "agent-1", "toolCallName": "Agent"}),
@@ -313,12 +315,23 @@ async def test_consume_events_maps_native_subagents_without_top_level_noise():
     callbacks = []
     deltas = []
     response = []
-    terminal = await runtime._consume_events(FakeWS(), response, deltas.append, callbacks.append)
+    lifecycle_seen: set[tuple[Any, ...]] = set()
+    terminal = await runtime._consume_events(
+        FakeWS(), response, deltas.append, callbacks.append, lifecycle_seen=lifecycle_seen,
+    )
     assert [event["type"] for event in callbacks if event["type"] in {
-        "subagent_start", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
+        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
     }] == [
-        "subagent_start", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
+        "subagent_start", "subagent_tool", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
     ]
+    child_tool = next(event for event in callbacks if event["type"] == "subagent_tool")
+    assert child_tool["agentId"] == "a1"
+    assert child_tool["agentName"] == "explore"
+    assert child_tool["toolCallId"] == "child-1"
+    assert child_tool["toolCallName"] == "read_file"
+    assert child_tool["parentToolCallId"] == "root-agent"
+    assert ("subagent_tool", "root-agent", "child-1") in lifecycle_seen
+    assert ("subagent_end", "root-agent") in lifecycle_seen
     assert terminal["subagents"][0]["agentName"] == "explore"
     ended = next(event for event in terminal["subagents"] if event["type"] == "subagent_end")
     assert ended["result"] == "child secret"

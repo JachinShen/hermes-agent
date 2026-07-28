@@ -7,7 +7,7 @@ export const SECTION_NAMES = ['thinking', 'tools', 'subagents', 'activity'] as c
 // Out-of-the-box per-section defaults — applied when the user hasn't pinned
 // an explicit override and layered ABOVE the global details_mode:
 //
-//   - thinking / tools: expanded — stream open so the turn reads like a
+//   - thinking / tools / subagents: expanded — stream open so the turn reads like a
 //     live transcript (reasoning + tool calls side by side) instead of a
 //     wall of chevrons the user has to click every turn.
 //   - activity: hidden — ambient meta (gateway hints, terminal-parity
@@ -15,14 +15,13 @@ export const SECTION_NAMES = ['thinking', 'tools', 'subagents', 'activity'] as c
 //     failures still render inline on the failing tool row, and ambient
 //     errors/warnings surface via the floating-alert backstop when every
 //     panel resolves to hidden.
-//   - subagents: not set — falls through to the global details_mode so
-//     Spawn trees stay under a chevron until a delegation actually happens.
 //
 // Opt out of any of these with `display.sections.<name>` in config.yaml
 // or at runtime via `/details <name> collapsed|hidden`.
 const SECTION_DEFAULTS: SectionVisibility = {
   thinking: 'expanded',
   tools: 'expanded',
+  subagents: 'expanded',
   activity: 'hidden'
 }
 
