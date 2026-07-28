@@ -1935,6 +1935,52 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _north_subagent_start_progress(event_type: str, tool_name: str = None,
+                                   preview: str = None, **kwargs):
+    """Return the compact Gateway display payload for a North child start."""
+    if event_type != "subagent.start":
+        return None
+    role = str(kwargs.get("role") or tool_name or "worker")
+    goal = str(kwargs.get("goal") or preview or "")
+    return role, goal
+
+
+def _forward_north_gateway_event(event: dict[str, Any], progress_callback) -> None:
+    """Map one direct-North event onto Gateway's public progress callback."""
+    kind = str(event.get("type") or "")
+    if kind == "subagent_start":
+        role = str(event.get("agentName") or event.get("agent_name") or "worker")
+        query = str(event.get("query") or event.get("prompt") or "")
+        progress_callback(
+            "subagent.start",
+            role,
+            query,
+            event,
+            subagent_id=event.get("agentId") or event.get("agent_id"),
+            parent_id=(
+                event.get("parentToolCallId") or event.get("parent_tool_call_id")
+                or event.get("parentRunId") or event.get("parent_run_id")
+            ),
+            goal=query,
+            status="running",
+            role=role,
+        )
+    elif kind == "tool_call_start":
+        progress_callback(
+            "tool.started",
+            str(event.get("toolCallName") or event.get("tool_name") or ""),
+            "",
+            event,
+        )
+    elif kind in {"tool_call_result", "tool_call_end"}:
+        progress_callback(
+            "tool.completed",
+            str(event.get("toolCallName") or event.get("tool_name") or ""),
+            str(event.get("content") or "")[:240],
+            event,
+        )
+
+
 def _schedule_north_review_after_turn(
     *,
     agent_history: list[dict],
@@ -18215,10 +18261,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # silent in chat. Handled before the progress_queue guard because
             # log mode runs without a chat progress queue.
             if log_queue is not None:
-                if event_type == "tool.started" and tool_name and tool_name != "_thinking":
+                north_start = _north_subagent_start_progress(
+                    event_type, tool_name, preview, **kwargs
+                )
+                if (event_type == "tool.started" and tool_name and tool_name != "_thinking") or north_start:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    preview_str = f' "{preview}"' if preview else ""
-                    log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+                    log_name, log_preview = north_start or (tool_name, preview)
+                    preview_str = f' "{log_preview}"' if log_preview else ""
+                    log_queue.put(f"{ts}  {log_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
             if not progress_queue or not _run_still_current():
@@ -18272,9 +18322,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not tool_progress_enabled:
                 return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in {"tool.started",}:
+            # North child starts use the same queue/formatting path as ordinary
+            # tool starts; child tool/complete events are intentionally quiet.
+            north_start = _north_subagent_start_progress(
+                event_type, tool_name, preview, **kwargs
+            )
+            if event_type != "tool.started" and not north_start:
                 return
+            if north_start:
+                tool_name, preview = north_start
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
@@ -19941,20 +19997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raise RuntimeError("This session is bound to ncoder, but North Coder runtime is not configured")
                 if _north_runtime is not None:
                     def _north_event_sync(_event: dict[str, Any]) -> None:
-                        _kind = str(_event.get("type") or "")
-                        if _kind == "tool_call_start":
-                            progress_callback(
-                                "tool.started",
-                                tool_name=_event.get("toolCallName") or _event.get("tool_name"),
-                                args=_event,
-                            )
-                        elif _kind in {"tool_call_result", "tool_call_end"}:
-                            progress_callback(
-                                "tool.completed",
-                                tool_name=_event.get("toolCallName") or _event.get("tool_name"),
-                                preview=str(_event.get("content") or "")[:240],
-                                args=_event,
-                            )
+                        _forward_north_gateway_event(_event, progress_callback)
                     result = asyncio.run(_north_runtime.run_turn(
                         message=(
                             provider_user_message

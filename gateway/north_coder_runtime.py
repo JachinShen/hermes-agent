@@ -25,6 +25,15 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 DeltaCallback = Callable[[str], None]
 
 
+def _terminal_subagents(terminal: dict[str, Any]) -> list[Any]:
+    """Return subagent metadata from either the stream or terminal result."""
+    streamed = terminal.get("subagents")
+    if streamed:
+        return streamed
+    result = terminal.get("result")
+    return result.get("subagents", []) if isinstance(result, dict) else []
+
+
 async def _interrupt_north_host(
     host_agent: Any,
     session_key: str,
@@ -239,7 +248,7 @@ class NorthCoderRuntime:
 
         full_response: list[str] = []
         invocation_id: Optional[str] = None
-        terminal: dict[str, Any] = {"status": "completed", "tools": []}
+        terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as client:
             ws = None
@@ -540,6 +549,7 @@ class NorthCoderRuntime:
                     "messages": [{"role": "user", "content": message}, {"role": "assistant", "content": ""}],
                     "api_calls": 1,
                     "tools": terminal.get("tools", []),
+                    "subagents": _terminal_subagents(terminal),
                     "completed": False,
                     "interrupted": False,
                     "failed": True,
@@ -555,6 +565,7 @@ class NorthCoderRuntime:
             "messages": [{"role": "user", "content": message}, {"role": "assistant", "content": text}],
             "api_calls": 1,
             "tools": terminal.get("tools", []),
+            "subagents": _terminal_subagents(terminal),
             "completed": status == "completed",
             "interrupted": status in {"cancelled", "canceled"},
             "failed": status in {"failed", "error"},
@@ -831,7 +842,7 @@ class NorthCoderRuntime:
 
         conversation_id = await self._conversation_id(session_key)
         full_response: list[str] = []
-        terminal: dict[str, Any] = {"status": "completed", "tools": []}
+        terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds, sock_read=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as client:
             try:
@@ -857,6 +868,7 @@ class NorthCoderRuntime:
             "messages": [{"role": "user", "content": "[Ask User Response]"}, {"role": "assistant", "content": text}],
             "api_calls": 1,
             "tools": terminal.get("tools", []),
+            "subagents": _terminal_subagents(terminal),
             "completed": status == "completed",
             "interrupted": status in {"cancelled", "canceled"},
             "failed": status in {"failed", "error"},
@@ -887,7 +899,8 @@ class NorthCoderRuntime:
         stream_text: bool = True,
     ) -> dict[str, Any]:
         replaying = False
-        terminal: dict[str, Any] = {"status": "completed", "tools": []}
+        terminal: dict[str, Any] = {"status": "completed", "tools": [], "subagents": []}
+        agent_control_call_ids: set[str] = set()
         while True:
             try:
                 item = await asyncio.wait_for(
@@ -915,24 +928,50 @@ class NorthCoderRuntime:
                 continue
             event = json.loads(item.data)
             kind = event.get("type")
+            parent_run_id = event.get("parentRunId") or event.get("parent_run_id")
             if kind == "replay_start":
                 replaying = True
             elif kind == "replay_end":
                 replaying = False
-            if on_event:
-                result = on_event(event)
-                if asyncio.iscoroutine(result):
-                    await result
-            if (replaying and not process_replay) or kind in {"history_ref", "replay_start", "replay_end"}:
+            if kind in {"history_ref", "replay_start", "replay_end"} or (replaying and not process_replay):
                 continue
+            # Child raw fragments are projected onto the root stream by North;
+            # only the explicit subagent lifecycle is root-visible.
+            if parent_run_id and kind not in {"subagent_start", "subagent_progress", "subagent_end"}:
+                continue
+            if kind in {"subagent_start", "subagent_progress", "subagent_end"}:
+                terminal.setdefault("subagents", []).append(event)
+            if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
+                parent_run_id = event.get("parentRunId") or event.get("parent_run_id")
+                call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                tool_name = event.get("toolCallName") or event.get("tool_name")
+                if call_id and str(tool_name or "") == "Agent":
+                    agent_control_call_ids.add(call_id)
+                is_agent_control = (
+                    (bool(call_id) and call_id in agent_control_call_ids)
+                    or str(tool_name or "") == "Agent"
+                )
+                if not parent_run_id and not is_agent_control:
+                    terminal.setdefault("tools", []).append(event)
+            if on_event:
+                parent_run_id = event.get("parentRunId") or event.get("parent_run_id")
+                tool_name = event.get("toolCallName") or event.get("tool_name")
+                call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                is_child_tool = kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"} and bool(parent_run_id)
+                is_agent_control = (
+                    (bool(call_id) and call_id in agent_control_call_ids)
+                    or str(tool_name or "") == "Agent"
+                )
+                if not (is_child_tool or is_agent_control):
+                    result = on_event(event)
+                    if asyncio.iscoroutine(result):
+                        await result
             if kind == "text_message_content" and stream_text:
                 delta = str(event.get("delta") or "")
                 if delta:
                     full_response.append(delta)
                     if on_delta:
                         on_delta(delta)
-            if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
-                terminal.setdefault("tools", []).append(event)
             if kind in {"requires_action", "run_requires_action", "invocation_requires_action", "permission_request", "ask_user"}:
                 terminal["status"] = "requires_action"
                 terminal["required_action"] = event.get("required_action") or event
@@ -1444,6 +1483,7 @@ class NorthCoderTUIAgent:
         # then reused across turns until facade.close().
         self._review_host = None
 
+
     def run_conversation(self, message: Any, *, conversation_history=None, stream_callback=None,
                          tool_start_callback=None, tool_complete_callback=None,
                          tool_progress_callback=None, reasoning_callback=None,
@@ -1453,6 +1493,7 @@ class NorthCoderTUIAgent:
             self.history = list(conversation_history)
 
         tool_names: dict[str, Any] = {}
+        agent_control_call_ids: set[str] = set()
 
         def on_event(event: dict[str, Any]) -> None:
             kind = str(event.get("type") or "")
@@ -1461,19 +1502,66 @@ class NorthCoderTUIAgent:
                 if process_text and reasoning_callback:
                     reasoning_callback(process_text)
                 return
+            if kind in {"subagent_start", "subagent_progress", "subagent_end"}:
+                role = str(event.get("agentName") or event.get("agent_name") or "worker")
+                subagent_id = str(event.get("agentId") or event.get("agent_id") or "")
+                parent_id = str(
+                    event.get("parentToolCallId") or event.get("parent_tool_call_id")
+                    or event.get("parentRunId") or event.get("parent_run_id") or ""
+                )
+                if kind == "subagent_start":
+                    if tool_progress_callback:
+                        tool_progress_callback(
+                            "subagent.start", role,
+                            str(event.get("query") or event.get("prompt") or ""), event,
+                            subagent_id=subagent_id, parent_id=parent_id,
+                            goal=str(event.get("query") or event.get("prompt") or ""),
+                            status="running", role=role,
+                        )
+                elif kind == "subagent_progress":
+                    if tool_progress_callback:
+                        completed = int(event.get("completedToolCalls") or event.get("completed_tool_calls") or 0)
+                        active = int(event.get("activeToolCalls") or event.get("active_tool_calls") or 0)
+                        last_tool = str(event.get("lastToolName") or event.get("last_tool_name") or role)
+                        tool_progress_callback(
+                            "subagent.tool", last_tool,
+                            f"{last_tool} ({completed + active} tools)", event,
+                            subagent_id=subagent_id, parent_id=parent_id,
+                            tool_count=completed + active,
+                        )
+                else:
+                    if tool_progress_callback:
+                        result = str(event.get("result") or "")
+                        tool_progress_callback(
+                            "subagent.complete", role,
+                            result[:240], event,
+                            subagent_id=subagent_id, parent_id=parent_id,
+                            status=str(event.get("status") or "completed"), summary=result,
+                        )
+                return
+            if kind in {"tool_call_start", "tool_call_args", "tool_call_end", "tool_call_result"}:
+                if event.get("parentRunId") or event.get("parent_run_id"):
+                    return
             if not (tool_start_callback or tool_complete_callback or tool_progress_callback):
                 return
             tool_name = event.get("toolCallName") or event.get("tool_name")
             call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
             if not tool_name:
                 tool_name = tool_names.get(call_id)
+            if kind == "tool_call_start" and str(tool_name or "") == "Agent" and call_id:
+                agent_control_call_ids.add(call_id)
+                return
+            if call_id and call_id in agent_control_call_ids:
+                return
+            if str(tool_name or "") == "Agent":
+                return
             if kind == "tool_call_start":
                 tool_names[call_id] = tool_name
                 if tool_start_callback:
                     tool_start_callback(call_id, tool_name, event)
                 if tool_progress_callback:
                     tool_progress_callback(
-                        "tool.started", name=tool_name, args=event,
+                        "tool.started", tool_name, None, event,
                     )
             elif kind in {"tool_call_result", "tool_call_end"}:
                 call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
@@ -1482,8 +1570,8 @@ class NorthCoderTUIAgent:
                     tool_complete_callback(call_id, tool_name, event, content)
                 if tool_progress_callback:
                     tool_progress_callback(
-                        "tool.completed", name=tool_name,
-                        preview=content[:240], args=event,
+                        "tool.completed", tool_name,
+                        content[:240], event,
                     )
 
         from agent.runtime_cwd import resolve_agent_cwd

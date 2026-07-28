@@ -195,6 +195,85 @@ _COMPACTABLE_TOOLS = (
     "background_task_manage",
 )
 
+_EXPLORE_NORTH_TOOLS = (
+    ("read_file", "file.read_file"),
+    ("search_file_content", "file.search_content"),
+    ("list_directory", "file.list_directory"),
+    ("glob", "file.glob"),
+    ("read_many_files", "file.read_many_files"),
+    ("web_search", "web.search"),
+    ("web_read", "web.read"),
+    ("read_only_shell_command", "catalog:read_only_shell_command"),
+)
+
+
+_READ_ONLY_SHELL_TOOL_YAML = """type: tool
+name: read_only_shell_command
+description: >-
+  Execute a strictly limited set of read-only shell commands for fast codebase
+  exploration.
+
+  Allowed commands: rg, find, ls, pwd, sed -n, git log, git blame, git grep.
+  Restrictions: no background execution, pipes, redirects, command chaining,
+  or multiline commands; use only for read-only exploration.
+input_schema:
+  type: object
+  properties:
+    command:
+      type: string
+      description: Exact read-only shell command to execute.
+    description:
+      type: string
+      description: Brief explanation of what you are checking.
+    dir_path:
+      type: string
+      description: Optional directory to run the command in.
+    timeout_ms:
+      type: integer
+      minimum: 0
+      maximum: 600000
+      description: Optional read-only command timeout in milliseconds.
+  required: [command]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#
+"""
+
+def _child_agent_yaml(
+    name: str,
+    prompt_name: str,
+    tools: tuple[tuple[str, str], ...],
+    skill_paths: list[str],
+    *,
+    max_context_tokens: int,
+    description: str,
+    bypass_tool_names: tuple[str, ...] = (),
+) -> str:
+    """Render a small North-native child profile with relative prompt paths."""
+    lines = [
+        "type: agent", f"name: {name}", f"description: >-", *[f"  {line}" for line in description.splitlines()],
+        f"max_context_tokens: {max_context_tokens}",
+        f"system_prompt: ./{prompt_name}", "system_prompt_type: file",
+        "max_iterations: 10000", "llm_config:", "  model: placeholder",
+        "  api_key: placeholder", "  base_url: https://api.openai.com/v1",
+        "", "sandbox_config:", "  type: local", "", "tools:",
+    ]
+    for tool_name, builtin in tools:
+        if tool_name == "read_only_shell_command":
+            lines.extend(["  - name: read_only_shell_command", "    yaml_path: ./tools/read_only_shell_command.tool.yaml", "    binding: catalog:read_only_shell_command"])
+        else:
+            lines.extend([f"  - name: {tool_name}", f"    builtin: {builtin}"])
+    lines.extend([
+        "", "middlewares:",
+        "  - import: nexau_builtin_middlewares:LongToolOutputMiddleware",
+        "    params:", "      max_output_chars: 20000", "      head_lines: 100", "      tail_lines: 50",
+    ])
+    if bypass_tool_names:
+        lines.extend(["      bypass_tool_names:"] + [f"        - {tool}" for tool in bypass_tool_names])
+    if skill_paths:
+        lines.extend(["", "skills:"])
+        lines.extend(f"  - {path}" for path in skill_paths)
+    return "\n".join(lines) + "\n"
+
 
 def _middlewares_yaml() -> str:
     """Return the ``middlewares:`` block for agent.yaml.
@@ -265,6 +344,7 @@ def export_hermes_profile(
     tool_specs_dir.mkdir(parents=True, exist_ok=True)
     (tool_specs_dir / "skill_manage.tool.yaml").write_text(_skill_manage_tool_yaml(), encoding="utf-8")
     (tool_specs_dir / "memory.tool.yaml").write_text(_memory_tool_yaml(), encoding="utf-8")
+    (tool_specs_dir / "read_only_shell_command.tool.yaml").write_text(_READ_ONLY_SHELL_TOOL_YAML, encoding="utf-8")
     (custom_tools_dir / "skill_manage_bridge.py").write_text(
         _skill_manage_bridge_py(hermes_home), encoding="utf-8"
     )
@@ -291,6 +371,13 @@ def export_hermes_profile(
         "system_prompt: ./system_prompt.md",
         "system_prompt_type: file",
         f"max_iterations: {max_iterations}",
+        "max_running_subagents: 8",
+        "",
+        "sub_agents:",
+        "  - name: explore",
+        "    config_path: ./explore_agent.yaml",
+        "  - name: worker",
+        "    config_path: ./worker_agent.yaml",
         "",
         "# Provider credentials and model are supplied by North runtime settings.",
         "llm_config:",
@@ -321,6 +408,31 @@ def export_hermes_profile(
         lines.extend(["", "skills:"])
         lines.extend(f"  - {path}" for path in skill_paths)
     (output_dir / "agent.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "explore_system_prompt.md").write_text(
+        """You are `explore`, a read-only code investigation sub-agent.
+
+Locate implementation points, call chains, data flow, and boundaries. Search first, read the minimum necessary files, and return evidence-backed conclusions. Never modify files or run side-effecting commands. If evidence is insufficient, say what remains unknown.
+
+Output: Conclusion; Evidence (path and line); Open questions; Suggested next step.
+""", encoding="utf-8")
+    (output_dir / "worker_system_prompt.md").write_text(
+        """You are `worker`, a focused implementation sub-agent.
+
+Make the requested change in the current local sandbox, keep the patch narrow, and verify it with the repository's existing checks. Read relevant files before editing, preserve existing contracts, and report changed paths, verification, and remaining risk.
+""", encoding="utf-8")
+    (output_dir / "explore_agent.yaml").write_text(
+        _child_agent_yaml(
+            "explore", "explore_system_prompt.md", _EXPLORE_NORTH_TOOLS, [],
+            max_context_tokens=120_000,
+            description="Specific, well-scoped, read-only codebase investigation. Take independent questions in parallel when possible and reuse an existing explorer.",
+        ), encoding="utf-8")
+    (output_dir / "worker_agent.yaml").write_text(
+        _child_agent_yaml(
+            "worker", "worker_system_prompt.md", _CORE_NORTH_TOOLS, skill_paths,
+            max_context_tokens=200_000,
+            description="Focused implementation and production work with explicit file and responsibility ownership. Do not roll back changes made by other parallel workers.",
+            bypass_tool_names=("write_file", "replace", "background_task_manage"),
+        ), encoding="utf-8")
     if tui_variant:
         _write_tui_variant(output_dir, lines)
         return output_dir / "agent-tui.yaml"
@@ -446,7 +558,8 @@ description: >-
   Switch to a logical Hermes Project or one of its exact registered worktree
   paths. This is a pure intent: the tool validates the selection, then returns
   structured JSON for the host to apply the switch.
-  The host applies the actual project switch (set_active, cwd, sidebar).
+  The host applies the actual session cwd switch; session cwd is authoritative and
+  this intent does not set_active or infer project ownership.
 input_schema:
   type: object
   properties:

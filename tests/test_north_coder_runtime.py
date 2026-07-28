@@ -10,7 +10,11 @@ import pytest
 from aiohttp import web
 
 from gateway.north_coder_runtime import NorthCoderRuntime, NorthCoderRuntimeConfig, NorthCoderTUIAgent
-from gateway.run import _north_provider_current_turn
+from gateway.run import (
+    _forward_north_gateway_event,
+    _north_provider_current_turn,
+    _north_subagent_start_progress,
+)
 from hermes_cli.north_coder_profile import export_hermes_profile
 
 
@@ -80,6 +84,356 @@ def test_north_tui_agent_forwards_tool_lifecycle_callbacks():
     assert [kind for kind, _ in events] == ["start", "complete"]
     assert events[0][1][0:2] == ("t-1", "read_file")
     assert events[1][1][0:2] == ("t-1", "read_file")
+
+
+def test_north_tui_agent_agent_control_ids_are_scoped_to_one_turn():
+    class FakeRuntime:
+        def __init__(self):
+            self.config = type("Config", (), {
+                "tui_variant": True,
+                "workspace_switch_supported": True,
+                "agent_yaml_path": None,
+            })()
+            self.hermes_home = Path("/tmp")
+            self.turn = 0
+
+        async def run_turn(self, **kwargs):
+            self.turn += 1
+            emit = kwargs["on_event"]
+            if self.turn == 1:
+                emit({"type": "tool_call_start", "toolCallId": "same-id", "toolCallName": "Agent"})
+                emit({"type": "tool_call_result", "toolCallId": "same-id", "content": "child"})
+            else:
+                emit({"type": "tool_call_start", "toolCallId": "same-id", "toolCallName": "read_file"})
+                emit({"type": "tool_call_result", "toolCallId": "same-id", "content": "root ok"})
+            return {"messages": [], "north_invocation_id": f"inv-{self.turn}"}
+
+        def extract_workspace_switch(self, terminal):
+            return None
+
+    lifecycle = []
+    agent = NorthCoderTUIAgent(cast(Any, FakeRuntime()), "cross-turn")
+    callbacks = {
+        "tool_start_callback": lambda *args: lifecycle.append(("start", args)),
+        "tool_complete_callback": lambda *args: lifecycle.append(("complete", args)),
+    }
+    agent.run_conversation("first", **callbacks)
+    agent.run_conversation("second", **callbacks)
+    assert [(kind, args[0], args[1]) for kind, args in lifecycle] == [
+        ("start", "same-id", "read_file"),
+        ("complete", "same-id", "read_file"),
+    ]
+
+
+def test_north_tui_agent_suppresses_unnamed_agent_fragments_within_turn():
+    class FakeRuntime:
+        def __init__(self):
+            self.config = type("Config", (), {"tui_variant": True, "workspace_switch_supported": True, "agent_yaml_path": None})()
+            self.hermes_home = Path("/tmp")
+
+        async def run_turn(self, **kwargs):
+            emit = kwargs["on_event"]
+            emit({"type": "tool_call_start", "toolCallId": "same-id", "toolCallName": "Agent"})
+            emit({"type": "tool_call_result", "toolCallId": "same-id", "content": "child"})
+            emit({"type": "tool_call_end", "toolCallId": "same-id", "content": "child"})
+            return {"messages": [], "north_invocation_id": "inv-1"}
+
+        def extract_workspace_switch(self, terminal):
+            return None
+
+    lifecycle = []
+    NorthCoderTUIAgent(cast(Any, FakeRuntime()), "single-turn").run_conversation(
+        "probe", tool_complete_callback=lambda *args: lifecycle.append(args)
+    )
+    assert lifecycle == []
+
+
+def test_north_tui_agent_public_seam_preserves_native_subagent_visibility_and_hides_child_noise():
+    class FakeRuntime:
+        def __init__(self):
+            self.config = type("Config", (), {"tui_variant": True, "workspace_switch_supported": True, "agent_yaml_path": None})()
+            self.hermes_home = Path("/tmp")
+
+        async def run_turn(self, **kwargs):
+            emit = kwargs["on_event"]
+            for event in (
+                {"type": "subagent_start", "agentId": "explore-1", "agentName": "explore", "query": "inspect files", "parentRunId": "root-run", "rootRunId": "root-run"},
+                {"type": "subagent_progress", "agentId": "explore-1", "agentName": "explore", "parentRunId": "root-run", "rootRunId": "root-run", "lastToolName": "read_file"},
+                {"type": "subagent_end", "agentId": "explore-1", "agentName": "explore", "parentRunId": "root-run", "rootRunId": "root-run", "status": "completed", "result": "child secret"},
+                {"type": "tool_call_start", "toolCallId": "agent-1", "toolCallName": "Agent", "args": {"query": "inspect files"}},
+                {"type": "tool_call_args", "toolCallId": "agent-1", "args": {"query": "inspect files"}},
+                {"type": "tool_call_end", "toolCallId": "agent-1"},
+                {"type": "tool_call_result", "toolCallId": "agent-1", "content": "child secret"},
+                {"type": "tool_call_start", "toolCallId": "child-1", "toolCallName": "read_file", "parentRunId": "child-run", "rootRunId": "root-run"},
+                {"type": "tool_call_result", "toolCallId": "child-1", "toolCallName": "read_file", "parentRunId": "child-run", "rootRunId": "root-run", "content": "child secret"},
+                {"type": "tool_call_start", "toolCallId": "root-1", "toolCallName": "read_file"},
+                {"type": "tool_call_result", "toolCallId": "root-1", "toolCallName": "read_file", "content": "root ok"},
+            ):
+                emit(event)
+            return {"messages": [{"role": "assistant", "content": "final"}], "north_invocation_id": "inv-1"}
+
+        def extract_workspace_switch(self, terminal):
+            return None
+
+    lifecycle, progress = [], []
+    agent = NorthCoderTUIAgent(cast(Any, FakeRuntime()), "session-public")
+    result = agent.run_conversation(
+        "probe",
+        tool_start_callback=lambda *args: lifecycle.append(("start", args)),
+        tool_complete_callback=lambda *args: lifecycle.append(("complete", args)),
+        tool_progress_callback=lambda *args, **kwargs: progress.append((args, kwargs)),
+    )
+    assert [(kind, args[0], args[1]) for kind, args in lifecycle] == [
+        ("start", "root-1", "read_file"), ("complete", "root-1", "read_file"),
+    ]
+    assert [args[0] for args, _ in progress] == [
+        "subagent.start", "subagent.tool", "subagent.complete",
+        "tool.started", "tool.completed",
+    ]
+    assert progress[0][0][1] == "explore"
+    assert progress[0][1]["subagent_id"] == "explore-1"
+    assert progress[0][1]["parent_id"] == "root-run"
+    assert progress[0][1]["goal"] == "inspect files"
+    assert progress[0][1]["status"] == "running"
+    assert progress[0][0][2] == "inspect files"
+    assert progress[1][0][1] == "read_file"
+    assert progress[1][1]["tool_count"] == 0
+    assert progress[1][0][2] == "read_file (0 tools)"
+    assert progress[2][0][1] == "explore"
+    assert progress[2][1]["subagent_id"] == "explore-1"
+    assert progress[2][1]["summary"] == "child secret"
+    assert progress[2][0][2] == "child secret"
+    assert progress[2][1]["status"] == "completed"
+    assert all("child secret" not in str(message) for message in result["messages"])
+
+
+def test_exported_profile_contains_native_explore_and_worker_artifacts(tmp_path):
+    import yaml
+
+    home = tmp_path / "hermes"
+    (home / "skills" / "fixture-skill").mkdir(parents=True)
+    (home / "skills" / "fixture-skill" / "SKILL.md").write_text("---\nname: fixture\n---\nfixture\n")
+    root = export_hermes_profile(home, tmp_path / "north-profile")
+    tui = export_hermes_profile(home, tmp_path / "north-profile", tui_variant=True)
+    artifact_dir = root.parent
+
+    for path in (
+        root,
+        tui,
+        artifact_dir / "explore_agent.yaml",
+        artifact_dir / "worker_agent.yaml",
+        artifact_dir / "explore_system_prompt.md",
+        artifact_dir / "worker_system_prompt.md",
+    ):
+        assert path.is_file(), path
+
+    explore = yaml.safe_load((artifact_dir / "explore_agent.yaml").read_text())
+    worker = yaml.safe_load((artifact_dir / "worker_agent.yaml").read_text())
+    for root_yaml in (root, tui):
+        config = yaml.safe_load(root_yaml.read_text())
+        assert config["max_running_subagents"] == 8
+        assert {item["name"] for item in config["sub_agents"]} == {"explore", "worker"}
+        for item in config["sub_agents"]:
+            assert (root_yaml.parent / item["config_path"]).is_file()
+
+    explore_names = {item["name"] for item in explore["tools"]}
+    worker_names = {item["name"] for item in worker["tools"]}
+    assert explore_names == {
+        "read_file", "search_file_content", "list_directory", "glob",
+        "read_many_files", "web_search", "web_read", "read_only_shell_command",
+    }
+    assert {"write_file", "replace", "apply_patch", "multiedit", "run_shell_command", "background_task_manage"}.isdisjoint(explore_names)
+    assert {"write_file", "replace", "apply_patch", "multiedit", "run_shell_command"} <= worker_names
+    assert explore["system_prompt"] == "./explore_system_prompt.md"
+    assert worker["system_prompt"] == "./worker_system_prompt.md"
+    assert explore["max_context_tokens"] == 120000
+    assert worker["max_context_tokens"] == 200000
+    assert "skills" not in explore or not explore["skills"]
+    assert worker["skills"]
+    assert (artifact_dir / "tools" / "read_only_shell_command.tool.yaml").is_file()
+    shell_entry = next(item for item in explore["tools"] if item["name"] == "read_only_shell_command")
+    assert shell_entry == {
+        "name": "read_only_shell_command",
+        "yaml_path": "./tools/read_only_shell_command.tool.yaml",
+        "binding": "catalog:read_only_shell_command",
+    }
+    assert "read-only" in explore["description"]
+    assert "well-scoped" in explore["description"]
+    assert "parallel" in explore["description"]
+    assert "ownership" in worker["description"]
+    assert "roll back" in worker["description"]
+    assert worker["middlewares"][0]["import"] == "nexau_builtin_middlewares:LongToolOutputMiddleware"
+    expected_params = {"max_output_chars": 20000, "head_lines": 100, "tail_lines": 50}
+    assert explore["middlewares"][0]["params"] == expected_params
+    assert worker["middlewares"][0]["params"] == {
+        **expected_params,
+        "bypass_tool_names": ["write_file", "replace", "background_task_manage"],
+    }
+    assert "bypass_tool_names" not in explore["middlewares"][0]["params"]
+    assert explore["llm_config"]["model"] == worker["llm_config"]["model"] == "placeholder"
+
+
+@pytest.mark.asyncio
+async def test_consume_events_maps_native_subagents_without_top_level_noise():
+    class Item:
+        type = SimpleNamespace(name="TEXT")
+
+        def __init__(self, event):
+            self.data = json.dumps(event)
+
+    class FakeWS:
+        def __init__(self):
+            self.items = iter([
+                Item({"type": "subagent_start", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "parentToolCallId": "root-agent"}),
+                Item({"type": "text_message_content", "delta": "child secret", "parentRunId": "run-child", "rootRunId": "run-root"}),
+                Item({"type": "thinking", "fragment": "child secret", "parentRunId": "run-child", "rootRunId": "run-root"}),
+                Item({"type": "tool_call_start", "toolCallId": "child-1", "toolCallName": "read_file", "parentRunId": "run-child", "rootRunId": "run-root"}),
+                Item({"type": "subagent_progress", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "completedToolCalls": 1, "activeToolCalls": 0}),
+                Item({"type": "subagent_end", "agentId": "a1", "agentName": "explore", "parentRunId": "run-root", "rootRunId": "run-root", "status": "completed", "result": "child secret"}),
+                Item({"type": "tool_call_start", "toolCallId": "agent-1", "toolCallName": "Agent"}),
+                Item({"type": "tool_call_args", "toolCallId": "agent-1"}),
+                Item({"type": "tool_call_end", "toolCallId": "agent-1"}),
+                Item({"type": "tool_call_result", "toolCallId": "agent-1", "content": "child secret"}),
+                Item({"type": "tool_call_start", "toolCallId": "root-1", "toolCallName": "read_file"}),
+                Item({"type": "tool_call_result", "toolCallId": "root-1", "toolCallName": "read_file", "content": "ok"}),
+                Item({"type": "text_message_content", "delta": "final"}),
+                Item({"type": "run_finished"}),
+            ])
+
+        async def receive(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                return SimpleNamespace(type=SimpleNamespace(name="CLOSED"), data="")
+
+        def exception(self):
+            return None
+
+    runtime = NorthCoderRuntime(NorthCoderRuntimeConfig(timeout_seconds=1), Path("/tmp"))
+    callbacks = []
+    deltas = []
+    response = []
+    terminal = await runtime._consume_events(FakeWS(), response, deltas.append, callbacks.append)
+    assert [event["type"] for event in callbacks if event["type"] in {
+        "subagent_start", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
+    }] == [
+        "subagent_start", "subagent_progress", "subagent_end", "tool_call_start", "tool_call_result",
+    ]
+    assert terminal["subagents"][0]["agentName"] == "explore"
+    ended = next(event for event in terminal["subagents"] if event["type"] == "subagent_end")
+    assert ended["result"] == "child secret"
+    assert all(event.get("parentRunId") is None for event in terminal["tools"])
+    assert all(event.get("toolCallName") != "Agent" for event in terminal["tools"])
+    assert terminal["tools"][-1]["toolCallName"] == "read_file"
+    assert response == ["final"]
+    assert deltas == ["final"]
+    assert all(
+        "child secret" not in str(event)
+        for event in callbacks
+        if event["type"] not in {"subagent_start", "subagent_progress", "subagent_end"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_events_process_replay_flag_controls_callbacks():
+    class Item:
+        type = SimpleNamespace(name="TEXT")
+
+        def __init__(self, event):
+            self.data = json.dumps(event)
+
+    class FakeWS:
+        def __init__(self):
+            self.items = iter([
+                Item({"type": "replay_start"}),
+                Item({"type": "tool_call_start", "toolCallId": "replayed", "toolCallName": "read_file"}),
+                Item({"type": "replay_end"}),
+                Item({"type": "run_finished"}),
+            ])
+
+        async def receive(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                return SimpleNamespace(type=SimpleNamespace(name="CLOSED"), data="")
+
+        def exception(self):
+            return None
+
+    runtime = NorthCoderRuntime(NorthCoderRuntimeConfig(timeout_seconds=1), Path("/tmp"))
+    ignored = []
+    await runtime._consume_events(FakeWS(), [], None, ignored.append, process_replay=False)
+    assert [event for event in ignored if event["type"] != "run_finished"] == []
+
+    delivered = []
+    await runtime._consume_events(FakeWS(), [], None, delivered.append, process_replay=True)
+    assert [event["type"] for event in delivered if event["type"] != "run_finished"] == ["tool_call_start"]
+
+
+@pytest.mark.asyncio
+async def test_consume_events_does_not_suppress_empty_call_id_events():
+    class Item:
+        type = SimpleNamespace(name="TEXT")
+
+        def __init__(self, event):
+            self.data = json.dumps(event)
+
+    class FakeWS:
+        def __init__(self):
+            self.items = iter([
+                Item({"type": "tool_call_start", "toolCallName": "read_file"}),
+                Item({"type": "tool_call_result", "content": "ok"}),
+                Item({"type": "run_finished"}),
+            ])
+
+        async def receive(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                return SimpleNamespace(type=SimpleNamespace(name="CLOSED"), data="")
+
+        def exception(self):
+            return None
+
+    runtime = NorthCoderRuntime(NorthCoderRuntimeConfig(timeout_seconds=1), Path("/tmp"))
+    events = []
+    terminal = await runtime._consume_events(FakeWS(), [], None, events.append)
+    assert [event["type"] for event in events if event["type"] != "run_finished"] == ["tool_call_start", "tool_call_result"]
+    assert [event["type"] for event in terminal["tools"]] == ["tool_call_start", "tool_call_result"]
+
+
+def test_gateway_subagent_start_progress_helper_only_exposes_start():
+    assert _north_subagent_start_progress(
+        "subagent.start", tool_name="worker", preview="goal", role="worker", goal="goal"
+    ) == ("worker", "goal")
+    assert _north_subagent_start_progress("subagent.tool", tool_name="read_file") is None
+    assert _north_subagent_start_progress("subagent.complete", tool_name="worker") is None
+
+
+def test_forward_north_gateway_event_maps_lifecycle_and_root_tools():
+    calls = []
+    callback = lambda *args, **kwargs: calls.append((args, kwargs))
+    event = {
+        "type": "subagent_start", "agentId": "a1", "agentName": "explore",
+        "query": "inspect files", "parentToolCallId": "agent-call",
+    }
+    _forward_north_gateway_event(event, callback)
+    assert calls == [(("subagent.start", "explore", "inspect files", event), {
+        "subagent_id": "a1", "parent_id": "agent-call", "goal": "inspect files",
+        "status": "running", "role": "explore",
+    })]
+
+    calls.clear()
+    _forward_north_gateway_event({"type": "subagent_progress", "agentId": "a1"}, callback)
+    _forward_north_gateway_event({"type": "subagent_end", "agentId": "a1"}, callback)
+    assert calls == []
+
+    _forward_north_gateway_event({"type": "tool_call_start", "toolCallName": "read_file"}, callback)
+    _forward_north_gateway_event({"type": "tool_call_result", "toolCallName": "read_file", "content": "ok"}, callback)
+    assert [call[0][:3] for call in calls] == [
+        ("tool.started", "read_file", ""),
+        ("tool.completed", "read_file", "ok"),
+    ]
 
 
 @pytest.mark.asyncio
