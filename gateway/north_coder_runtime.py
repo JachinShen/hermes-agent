@@ -263,10 +263,7 @@ class NorthCoderRuntime:
                     "metadata": payload["metadata"],
                     "conversation_options": {
                         "title": f"Hermes {session_key[-80:]}",
-                        "agent_config": {
-                            "agent_profile_id": self.config.agent_profile_id,
-                            "inherit_root_model_for_subagents": True,
-                        },
+                        "agent_config": {"agent_profile_id": self.config.agent_profile_id},
                     },
                 }
                 if effective_workdir:

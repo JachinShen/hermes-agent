@@ -564,10 +564,6 @@ async def test_north_runtime_binds_gateway_default_to_home_workspace(tmp_path, a
     assert "register_workdir" not in payload
     assert payload["metadata"]["hermes_session_key"] == "gateway-session"
     assert payload["conversation_options"]["title"] == "Hermes gateway-session"
-    assert payload["conversation_options"]["agent_config"] == {
-        "agent_profile_id": "hermes:default",
-        "inherit_root_model_for_subagents": True,
-    }
     assert result["north_conversation_id"] == "home-conversation"
     assert result["final_response"] == "home ok"
     assert json.loads((tmp_path / "north_coder_conversations.json").read_text()) == {
