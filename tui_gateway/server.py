@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -1560,6 +1560,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if current.get("runtime_override"):
+                    kw["runtime_override"] = current["runtime_override"]
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2049,7 +2051,9 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
                 return
             with _session_db(db_session) as db:
                 if db is not None:
-                    db.update_session_cwd(session_key, cwd, branch, root)
+                    db.update_session_git_metadata_if_cwd_matches(
+                        session_key, cwd, branch, root
+                    )
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
@@ -2518,6 +2522,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
+    agent_runtime = str(model_config.get("agent_runtime") or "").strip().lower()
 
     # Heal a bare ``"custom"`` provider stored by an older build (or any leak
     # site that bypassed _runtime_model_config's normalization). Bare custom is
@@ -2559,6 +2564,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:
         overrides["service_tier_override"] = service_tier
+    if agent_runtime in {"native", "ncoder"}:
+        overrides["runtime_override"] = agent_runtime
 
     return overrides
 
@@ -2571,6 +2578,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
+    agent_runtime = str(getattr(agent, "runtime_override", "") or "").strip().lower()
 
     if model:
         config["model"] = model
@@ -2617,6 +2625,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    if agent_runtime in {"native", "ncoder"}:
+        config["agent_runtime"] = agent_runtime
+    else:
+        config.pop("agent_runtime", None)
 
     return config
 
@@ -4209,65 +4221,133 @@ def _agent_cbs(sid: str) -> dict:
     }
 
 
-def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
-    """Intentional workspace move from the project_* tools: re-anchor the live
-    session's cwd to the chosen project's folder and push session.info so the
-    desktop follows (refresh tree + scope into the project). This is the ONLY
-    auto-cwd path — driven by an explicit tool call, never a terminal `cd`."""
-    if not path:
-        return
+_session_workdir_service = None
+_session_workdir_service_lock = threading.Lock()
 
-    # The tool's task_id is the durable session_key, but _sessions is keyed by a
-    # short sid uuid (and the desktop routes events by that sid). Resolve it.
-    key = str(task_id or "")
-    sid = ""
-    session = None
+
+def _workspace_find_session(key: str):
     with _sessions_lock:
-        if key in _sessions:
-            sid, session = key, _sessions[key]
-        else:
-            for cand_sid, cand in _sessions.items():
-                if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
-                    sid, session = cand_sid, cand
-                    break
+        matches = []
+        for sid, candidate in _sessions.items():
+            if sid == key or candidate.get("session_key") == key:
+                matches.append(candidate)
+                continue
+            if getattr(candidate.get("agent"), "session_id", None) == key:
+                matches.append(candidate)
+        unique = {id(candidate): candidate for candidate in matches}
+        if len(unique) > 1:
+            return None
+        return next(iter(unique.values()), None)
 
-    if session is None:
-        return
 
-    resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if not os.path.isdir(resolved):
-        return
+def _workspace_registered_paths() -> set[str]:
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.projects_db import connect_closing
+    with connect_closing() as conn:
+        return {
+            str(folder.path)
+            for item in pdb.list_projects(conn, include_archived=True)
+            for folder in item.folders
+        }
 
-    session["cwd"] = resolved
-    session["explicit_cwd"] = True
-    _register_session_cwd(session)
 
+def _workspace_persist_cwd(session: dict[str, Any], cwd: str) -> None:
     with _session_db(session) as db:
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist project workspace cwd", exc_info=True)
+        if db is None:
+            raise RuntimeError("session database unavailable")
+        db.update_session_cwd(session.get("session_key", ""), cwd)
 
-    _persist_session_git_meta(session, resolved)
 
-    try:
-        agent = session.get("agent")
-        info = (
-            _session_info(agent, session)
-            if agent is not None
-            else {"cwd": resolved, "branch": _git_branch_for_cwd(resolved), "lazy": True}
-        )
-        _emit("session.info", sid, info)
-    except Exception:
-        logger.debug("failed to emit session.info after project workspace move", exc_info=True)
+def _workspace_terminal_snapshot(key: str):
+    from tools.terminal_tool import snapshot_task_cwd_state
+    return snapshot_task_cwd_state(key)
+
+
+def _workspace_terminal_apply(key: str, cwd: str) -> None:
+    from tools.terminal_tool import register_task_env_overrides
+    register_task_env_overrides(key, {"cwd": cwd})
+
+
+def _workspace_terminal_restore(key: str, snapshot) -> None:
+    from tools.terminal_tool import restore_task_cwd
+    restore_task_cwd(key, snapshot or {})
+
+
+def _get_session_workdir_service():
+    global _session_workdir_service
+    if _session_workdir_service is None:
+        with _session_workdir_service_lock:
+            if _session_workdir_service is None:
+                from tui_gateway.session_workdir import SessionWorkdirContext, SessionWorkdirService
+                _session_workdir_service = SessionWorkdirService(SessionWorkdirContext(
+                    session_lookup=_workspace_find_session,
+                    registered_paths=_workspace_registered_paths,
+                    persist_cwd=_workspace_persist_cwd,
+                    terminal_snapshot=_workspace_terminal_snapshot,
+                    terminal_apply=_workspace_terminal_apply,
+                    terminal_restore=_workspace_terminal_restore,
+                    git_metadata=lambda s, cwd: _persist_session_git_meta(s, cwd),
+                    emit_session_info=lambda sid, info: _emit("session.info", sid, info),
+                    session_info=lambda s: _session_info(s.get("agent"), s),
+                ))
+    return _session_workdir_service
+
+
+def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> bool:
+    """Apply a project path through the process-wide workspace service."""
+    if not path:
+        return False
+    receipt = _get_session_workdir_service().switch(str(task_id), path)
+    return receipt.success
+
+
+def _make_north_workspace_switch_callback(
+    session_id: str,
+) -> Callable[[dict[str, Any]], Optional[str]]:
+    """Apply North's path intent without changing Project ownership."""
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.projects_db import connect_closing
+
+    def callback(ws: dict[str, Any]) -> Optional[str]:
+        if _workspace_find_session(session_id) is None:
+            return f"no active session found for '{session_id}'"
+        selector = str(ws.get("project") or ws.get("project_id") or "").strip()
+        path = str(ws.get("path") or ws.get("selected_path") or "").strip()
+        if not path and selector and os.path.isabs(os.path.expanduser(selector)):
+            path = selector
+        if not path and selector:
+            with connect_closing() as conn:
+                projects = pdb.list_projects(conn, include_archived=True)
+                exact = [p for p in projects if selector in (str(p.id), p.slug) or p.name == selector]
+                if not exact:
+                    low = selector.lower()
+                    exact = [p for p in projects if p.slug.lower() == low or p.name.lower() == low]
+                if len(exact) != 1:
+                    return f"project selector '{selector}' is ambiguous or not found"
+                project = exact[0]
+                path = str(project.primary_path or "")
+                if not path:
+                    path = next((f.path for f in project.folders if f.is_primary), "")
+                if not path and project.folders:
+                    path = project.folders[0].path
+        if not path:
+            return "workspace_switch missing project or absolute path"
+        receipt = _get_session_workdir_service().switch(session_id, path)
+        if not receipt.success:
+            detail = receipt.error or "unknown error"
+            if receipt.rollback_error:
+                detail += f"; {receipt.rollback_error}"
+            return f"failed to switch session workdir: {detail}"
+        ws["selected_path"] = receipt.path
+        return None
+
+    return callback
 
 
 def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
-
     set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
 
@@ -4794,6 +4874,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    runtime_override: str | None = None,
     platform_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
@@ -4805,9 +4886,49 @@ def _make_agent(
     if synthetic is not None:
         return synthetic
 
-    from run_agent import AIAgent
+    cfg = _load_cfg()
+    try:
+        from gateway.north_coder_runtime import tui_agent_from_raw
+        if runtime_override != "native":
+            # Lazy factory for background review sidecar host.
+            # Only built when nudge thresholds are met — never per-turn.
+            # Captures the current _make_agent params so the Hermes AIAgent
+            # review host shares the same session identity, model, provider,
+            # reasoning config, etc.
+            def _make_review_host():
+                host = _make_agent(
+                    sid, key,
+                    session_id=session_id,
+                    session_db=session_db,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    reasoning_config_override=reasoning_config_override,
+                    service_tier_override=service_tier_override,
+                    platform_override=platform_override,
+                    runtime_override="native",
+                )
+                # Prevent the sidecar host from persisting its own session
+                # snapshot or ending the canonical TUI session.
+                if host is not None:
+                    host._persist_disabled = True
+                    host._end_session_on_close = False
+                return host
 
-    # MCP tool discovery runs in a background daemon thread at startup so a
+            north_agent = tui_agent_from_raw(
+                cfg, Path(_hermes_home), session_id or key,
+                _review_host_factory=_make_review_host,
+                workspace_switch_callback=_make_north_workspace_switch_callback(
+                    session_id or key,
+                ),
+            )
+            if north_agent is not None:
+                north_agent.runtime_override = runtime_override or "ncoder"
+                logger.info("Using North Coder runtime for TUI session %s", session_id or key)
+                return north_agent
+    except Exception:
+        logger.exception("Failed to initialize North Coder runtime for TUI")
+
+    from run_agent import AIAgent
     # dead server can't freeze the shell.  The agent snapshots its tool list
     # once here and never re-reads it, so briefly wait for in-flight discovery
     # to land before building — bounded, so a slow/dead server still can't
@@ -4968,6 +5089,31 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+
+
+class _PostDeliveryCallback:
+    """Queue review notices until the foreground message is complete."""
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._released = False
+        self._pending: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
+            if not self._released:
+                self._pending.append(message)
+                return
+        self._callback(message)
+
+    def release(self) -> None:
+        with self._lock:
+            self._released = True
+            pending = list(self._pending)
+            self._pending.clear()
+        for message in pending:
+            self._callback(message)
 
 
 def _init_session(
@@ -9342,6 +9488,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        review_delivery = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9363,6 +9510,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
+            review_callback = getattr(agent, "background_review_callback", None)
+            if callable(review_callback):
+                review_delivery = _PostDeliveryCallback(review_callback)
+                agent.background_review_callback = review_delivery
             _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
@@ -9471,8 +9622,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 "stream_callback": _stream,
             }
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
+                _run_signature = inspect.signature(agent.run_conversation)
+                if "task_id" in _run_signature.parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                _callback_names = {
+                    "tool_start_callback",
+                    "tool_complete_callback",
+                    "tool_progress_callback",
+                    "reasoning_callback",
+                }
+                if any(name in _run_signature.parameters for name in _callback_names):
+                    _callbacks = _agent_cbs(sid)
+                    for name in _callback_names:
+                        if name in _run_signature.parameters:
+                            run_kwargs[name] = _callbacks[name]
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -9527,6 +9690,29 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            if getattr(
+                                agent, "gateway_managed_history_persistence", False
+                            ):
+                                try:
+                                    _ensure_session_db_row(session)
+                                    with _session_db(session) as scoped_db:
+                                        if scoped_db is not None:
+                                            stored_count = len(
+                                                scoped_db.get_messages(
+                                                    session["session_key"]
+                                                )
+                                            )
+                                            for message in result["messages"][stored_count:]:
+                                                scoped_db.append_message(
+                                                    session_id=session["session_key"],
+                                                    role=message.get("role", "assistant"),
+                                                    content=message.get("content"),
+                                                )
+                                except Exception:
+                                    logger.warning(
+                                        "failed to persist external-runtime TUI history",
+                                        exc_info=True,
+                                    )
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -9593,6 +9779,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+            if review_delivery is not None:
+                review_delivery.release()
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -13570,6 +13758,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "models",
         "prompt",
         "rename",
+        "runtime",
         "status",
         "usage",
     }
@@ -13751,9 +13940,67 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
+def _format_live_runtime_output(session: dict) -> str:
+    agent = session.get("agent")
+    runtime = getattr(agent, "runtime_override", None)
+    if not runtime:
+        runtime = "ncoder" if getattr(agent, "provider", "") == "north_coder" else "native"
+    return f"Current agent runtime: {runtime}"
+
+
+def _switch_session_runtime(sid: str, session: dict, target: str) -> str:
+    target = target.strip().lower()
+    if target not in {"native", "ncoder"}:
+        return "Usage: /runtime [native|ncoder]"
+    if session.get("running"):
+        return "session busy — /interrupt the current turn before switching runtime"
+    current = session.get("agent")
+    current_runtime = getattr(current, "runtime_override", None)
+    if not current_runtime:
+        current_runtime = "ncoder" if getattr(current, "provider", "") == "north_coder" else "native"
+    if current_runtime == target:
+        return f"Agent runtime already: {target}"
+    try:
+        tokens = _set_session_context(session["session_key"])
+        try:
+            new_agent = _make_agent(
+                sid,
+                session["session_key"],
+                session_id=session["session_key"],
+                session_db=_get_db(),
+                model_override=session.get("model_override"),
+                runtime_override=target,
+                platform_override=_session_source(session),
+            )
+        finally:
+            _clear_session_context(tokens)
+        provider_runtime = getattr(current, "runtime", None) or getattr(new_agent, "runtime", None)
+        if provider_runtime is not None and hasattr(provider_runtime, "detach_session"):
+            provider_runtime.detach_session(session["session_key"])
+        setattr(new_agent, "runtime_override", target)
+        if current is not None and hasattr(current, "close"):
+            current.close()
+        session["runtime_override"] = target
+        session["agent"] = new_agent
+        _persist_live_session_runtime(session)
+        _restart_slash_worker(sid, session)
+        _wire_callbacks(sid)
+        _emit("session.info", sid, _session_info(new_agent, session))
+        return f"Switched agent runtime: {target}"
+    except Exception as exc:
+        logger.exception("Failed to switch TUI agent runtime to %s", target)
+        return f"runtime switch failed: {exc}"
+
+
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
+    if name == "runtime":
+        if session is None:
+            return "No active session."
+        if not arg.strip():
+            return _format_live_runtime_output(session)
+        return _switch_session_runtime(sid, session, arg)
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:

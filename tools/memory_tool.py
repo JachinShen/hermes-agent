@@ -165,8 +165,12 @@ class MemoryStore:
             ),
         }
 
-    def load_from_disk(self):
+    def load_from_disk(self, memory_dir: Optional[Path] = None):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+
+        ``memory_dir`` lets profile exporters build a snapshot for an explicit
+        Hermes profile without mutating process-global ``HERMES_HOME``. Native
+        agent sessions omit it and retain the active-profile behavior.
 
         The frozen snapshot is what enters the system prompt. We scan each
         entry for injection/promptware patterns at snapshot-build time —
@@ -182,7 +186,7 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
+        mem_dir = memory_dir if memory_dir is not None else get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")

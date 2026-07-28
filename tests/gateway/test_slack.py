@@ -3923,6 +3923,19 @@ class TestSlashCommands:
         assert msg.text == "/btw run the tests"
 
     @pytest.mark.asyncio
+    async def test_legacy_hermes_runtime_switch_works_with_stale_manifest(self, adapter):
+        """The catch-all stays usable when /runtime is absent from the installed app."""
+        command = {
+            "command": "/hermes",
+            "text": "runtime native",
+            "user_id": "U1",
+            "channel_id": "C1",
+        }
+        await adapter._handle_slash_command(command)
+        msg = adapter.handle_message.call_args[0][0]
+        assert msg.text == "/runtime native"
+
+    @pytest.mark.asyncio
     async def test_legacy_hermes_freeform_question(self, adapter):
         """/hermes <free-form text> must stay as the raw text (non-command)."""
         command = {

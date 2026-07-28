@@ -72,10 +72,10 @@ describe('resolveSections', () => {
 })
 
 describe('sectionMode', () => {
-  it('falls back to the global mode for sections without a built-in default', () => {
-    expect(sectionMode('subagents', 'collapsed', {})).toBe('collapsed')
+  it('streams subagent progress expanded by default for persisted config values', () => {
+    expect(sectionMode('subagents', 'collapsed', {})).toBe('expanded')
     expect(sectionMode('subagents', 'expanded', undefined)).toBe('expanded')
-    expect(sectionMode('subagents', 'hidden', {})).toBe('hidden')
+    expect(sectionMode('subagents', 'hidden', {})).toBe('expanded')
   })
 
   it('streams thinking + tools expanded by default for persisted config values', () => {

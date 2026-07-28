@@ -137,6 +137,29 @@ class TestSessionLifecycle:
         assert session["cwd"] == "/work/repo"
         assert session["git_branch"] == "pets-feature"
 
+    def test_git_metadata_cas_does_not_rewrite_newer_cwd(self, db):
+        db.create_session(session_id="s1", source="cli", cwd="/old")
+        db.update_session_cwd("s1", "/new")
+
+        assert not db.update_session_git_metadata_if_cwd_matches(
+            "s1", "/old", "old-branch", "/old-repo"
+        )
+        session = db.get_session("s1")
+        assert session["cwd"] == "/new"
+        assert session["git_branch"] is None
+        assert session["git_repo_root"] is None
+
+    def test_git_metadata_cas_updates_when_cwd_matches(self, db):
+        db.create_session(session_id="s1", source="cli", cwd="/repo")
+
+        assert db.update_session_git_metadata_if_cwd_matches(
+            "s1", "/repo", "feature", "/repo"
+        )
+        session = db.get_session("s1")
+        assert session["cwd"] == "/repo"
+        assert session["git_branch"] == "feature"
+        assert session["git_repo_root"] == "/repo"
+
     def test_update_session_cwd_empty_branch_does_not_clobber(self, db):
         """A failed branch probe (empty string) must not wipe a branch we
         already captured — only the cwd updates."""

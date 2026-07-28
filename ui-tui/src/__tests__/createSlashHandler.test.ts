@@ -70,6 +70,46 @@ describe('createSlashHandler', () => {
     expect(getOverlayState().sessions).toBe(true)
   })
 
+  it('changes the active session workspace through /cwd', async () => {
+    patchUiState({
+      info: { cwd: '/old', model: 'north-coder', skills: {}, tools: {} },
+      sid: 'sid-abc'
+    })
+    const rpc = vi.fn(() =>
+      Promise.resolve({ cwd: '/workspace/a', model: 'north-coder', skills: {}, tools: {} })
+    )
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/cwd /workspace/a')).toBe(true)
+    expect(ctx.session.guardBusySessionSwitch).toHaveBeenCalledWith('change workspace')
+    expect(rpc).toHaveBeenCalledWith('session.cwd.set', {
+      cwd: '/workspace/a',
+      session_id: 'sid-abc'
+    })
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+
+    await vi.waitFor(() => {
+      expect(getUiState().info?.cwd).toBe('/workspace/a')
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('cwd → /workspace/a')
+    })
+  })
+
+  it('requires a path and blocks /cwd while the session is busy', () => {
+    const ctx = buildCtx({
+      gateway: { ...buildGateway(), rpc: vi.fn(() => Promise.resolve({})) },
+      session: { ...buildSession(), guardBusySessionSwitch: vi.fn(() => true) }
+    })
+    const handler = createSlashHandler(ctx)
+
+    expect(handler('/cwd')).toBe(true)
+    expect(ctx.transcript.sys).toHaveBeenCalledWith('usage: /cwd <path>')
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+
+    expect(handler('/cwd /workspace/b')).toBe(true)
+    expect(ctx.session.guardBusySessionSwitch).toHaveBeenCalledWith('change workspace')
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+  })
+
   it('handles /redraw locally without slash worker fallback', () => {
     const ctx = buildCtx()
 

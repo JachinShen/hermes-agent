@@ -1935,6 +1935,79 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _north_subagent_start_progress(event_type: str, tool_name: str = None,
+                                   preview: str = None, **kwargs):
+    """Return the compact Gateway display payload for a North child start."""
+    if event_type != "subagent.start":
+        return None
+    role = str(kwargs.get("role") or tool_name or "worker")
+    goal = str(kwargs.get("goal") or preview or "")
+    return role, goal
+
+
+def _forward_north_gateway_event(event: dict[str, Any], progress_callback) -> None:
+    """Map one direct-North event onto Gateway's public progress callback."""
+    kind = str(event.get("type") or "")
+    if kind == "subagent_start":
+        role = str(event.get("agentName") or event.get("agent_name") or "worker")
+        query = str(event.get("query") or event.get("prompt") or "")
+        progress_callback(
+            "subagent.start",
+            role,
+            query,
+            event,
+            subagent_id=event.get("agentId") or event.get("agent_id"),
+            parent_id=(
+                event.get("parentToolCallId") or event.get("parent_tool_call_id")
+                or event.get("parentRunId") or event.get("parent_run_id")
+            ),
+            goal=query,
+            status="running",
+            role=role,
+        )
+    elif kind == "tool_call_start":
+        progress_callback(
+            "tool.started",
+            str(event.get("toolCallName") or event.get("tool_name") or ""),
+            "",
+            event,
+        )
+    elif kind in {"tool_call_result", "tool_call_end"}:
+        progress_callback(
+            "tool.completed",
+            str(event.get("toolCallName") or event.get("tool_name") or ""),
+            str(event.get("content") or "")[:240],
+            event,
+        )
+
+
+def _schedule_north_review_after_turn(
+    *,
+    agent_history: list[dict],
+    result: dict,
+    session_id: str | None,
+    session_key: str | None,
+    review_host,
+    background_review_callback,
+    memory_notifications: str,
+) -> None:
+    """Schedule Hermes review from a completed Gateway North turn."""
+    if not result.get("completed") or result.get("interrupted") or result.get("requires_action"):
+        return
+    from gateway.north_coder_runtime import schedule_north_background_review
+
+    canonical = list(agent_history)
+    canonical.extend(result.get("messages", []) or [])
+    schedule_north_background_review(
+        canonical_history=canonical,
+        north_result=result,
+        session_id=session_id or session_key or "gateway-anonymous",
+        review_host=review_host,
+        background_review_callback=background_review_callback,
+        memory_notifications=memory_notifications,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -2300,6 +2373,23 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+
+
+def _north_provider_current_turn(event: Any, source: Any) -> tuple[str, dict[str, Any]]:
+    """Return the unadorned user turn plus structured platform context.
+
+    Gateway's native model-facing message may contain sender attribution,
+    reply pointers, channel backfill, attachment notes, or timestamps. North
+    owns its own conversation UI, so persisting those annotations as the
+    current user instruction produces misleading turns. Keep the platform text
+    exact and carry attribution separately.
+    """
+    return str(getattr(event, "text", "") or ""), {
+        "hermes_sender_name": getattr(source, "user_name", None),
+        "hermes_reply_to_message_id": getattr(event, "reply_to_message_id", None),
+        "hermes_reply_to_text": getattr(event, "reply_to_text", None),
+    }
+
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
@@ -9483,6 +9573,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
                     )
+                    if _pending_clarify.clarify_id.startswith("north:"):
+                        try:
+                            from tools import north_actions
+                            _north_action = north_actions.get(_quick_key)
+                            if _north_action and _north_action.get("kind") == "ask_user":
+                                _required = _north_action.get("required_action") or {}
+                                _requests = _required.get("pending_requests") or _required.get("questions") or []
+                                if not isinstance(_requests, list) or not _requests:
+                                    _requests = [{}]
+                                _raw_lines = [line.strip() for line in _raw_clarify_reply.splitlines() if line.strip()]
+                                _numbered_answers: dict[int, str] = {}
+                                for _line in _raw_lines:
+                                    _match = re.match(r"^(\d+)\s*[.):-]\s*(.*)$", _line)
+                                    if _match:
+                                        _numbered_answers[int(_match.group(1)) - 1] = _match.group(2).strip()
+                                _answer_values = (
+                                    [_numbered_answers.get(index, "") for index in range(len(_requests))]
+                                    if _numbered_answers
+                                    else [_raw_clarify_reply] + [""] * (len(_requests) - 1)
+                                )
+                                _answers = []
+                                for _index, (_request, _value) in enumerate(zip(_requests, _answer_values)):
+                                    _request = _request if isinstance(_request, dict) else {}
+                                    _answer = {
+                                        "questionIndex": _index,
+                                        "header": _request.get("header") or _request.get("prompt") or f"Question {_index + 1}",
+                                        "type": _request.get("type") or "text",
+                                        "value": _value,
+                                    }
+                                    if _request.get("type") == "choice" and _request.get("options"):
+                                        _answer["selectedOptions"] = [
+                                            _option_index for _option_index, _option in enumerate(_request["options"])
+                                            if str(_option.get("label") if isinstance(_option, dict) else _option).casefold() == _value.casefold()
+                                        ]
+                                    _answers.append(_answer)
+                                _resume_consumer = None
+                                _resume_stream_task = None
+                                _resume_adapter = self._adapter_for_source(source)
+                                try:
+                                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                                    from gateway.config import StreamingConfig
+                                    _resume_scfg = getattr(getattr(self, "config", None), "streaming", None) or StreamingConfig()
+                                    if _resume_adapter and _resume_scfg.enabled and _resume_scfg.transport != "off":
+                                        _resume_consumer = GatewayStreamConsumer(
+                                            adapter=_resume_adapter,
+                                            chat_id=source.chat_id,
+                                            config=StreamConsumerConfig(
+                                                edit_interval=_resume_scfg.edit_interval,
+                                                buffer_threshold=_resume_scfg.buffer_threshold,
+                                                cursor=_resume_scfg.cursor,
+                                                transport=_resume_scfg.transport or "edit",
+                                                chat_type=getattr(source, "chat_type", "") or "",
+                                            ),
+                                            metadata=self._thread_metadata_for_source(source, _north_action.get("event_message_id")),
+                                            initial_reply_to_id=_north_action.get("event_message_id"),
+                                        )
+                                        _resume_stream_task = asyncio.create_task(_resume_consumer.run())
+                                    _resume_result = await _north_action["runtime"].resume_ask_user_turn(
+                                        str(_north_action.get("invocation_id") or ""),
+                                        _answers,
+                                        session_key=_quick_key,
+                                        hermes_session_id=str(_north_action.get("hermes_session_id") or _quick_key),
+                                        source=source,
+                                        on_delta=_resume_consumer.on_delta if _resume_consumer else None,
+                                    )
+                                finally:
+                                    if _resume_consumer is not None:
+                                        _resume_consumer.finish()
+                                    if _resume_stream_task is not None:
+                                        try:
+                                            await asyncio.wait_for(_resume_stream_task, timeout=5.0)
+                                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                                            _resume_stream_task.cancel()
+                                _required_next = _resume_result.get("required_action") or {}
+                                _next_type = _required_next.get("type") or _required_next.get("action_type")
+                                _next_action_id = _required_next.get("action_id") or _required_next.get("tool_call_id")
+                                if _resume_result.get("requires_action") and _next_action_id:
+                                    north_actions.pop(_quick_key)
+                                    _clarify_mod.clear_session(_quick_key)
+                                    north_actions.register(_quick_key, {
+                                        "kind": "ask_user" if _next_type == "ask_user" else ("permission" if _next_type in {"permission_request", "permission"} else "action"),
+                                        "invocation_id": _resume_result.get("north_invocation_id"),
+                                        "tool_call_id": _next_action_id,
+                                        "required_action": _required_next,
+                                        "runtime": _north_action["runtime"],
+                                        "hermes_session_id": _north_action.get("hermes_session_id"),
+                                        "context_prompt": _north_action.get("context_prompt"),
+                                        "source": source,
+                                        "event_message_id": _north_action.get("event_message_id"),
+                                    })
+                                    if _next_type == "ask_user":
+                                        _next_requests = _required_next.get("pending_requests") or _required_next.get("questions") or []
+                                        _next_first = _next_requests[0] if isinstance(_next_requests, list) and _next_requests else _required_next
+                                        _next_question = str(_next_first.get("prompt") or _next_first.get("question") or "North Coder is asking for more information.") if isinstance(_next_first, dict) else str(_next_first)
+                                        _next_choices = _next_first.get("options") or _next_first.get("choices") if isinstance(_next_first, dict) else None
+                                        _clarify_mod.register(
+                                            f"north:{_next_action_id}",
+                                            _quick_key,
+                                            _next_question,
+                                            [str(item.get("label") if isinstance(item, dict) else item) for item in _next_choices] if _next_choices else None,
+                                        )
+                                else:
+                                    north_actions.pop(_quick_key)
+                                    _clarify_mod.clear_session(_quick_key)
+                                return _resume_result.get("final_response", "")
+                        except Exception as exc:
+                            logger.exception("Failed to resume North ask_user action")
+                            return f"North ask_user resume failed: {exc}"
                     # The clarify callback pauses the platform typing/status
                     # indicator while waiting so Slack users can type their
                     # answer. The active agent resumes as soon as this reply
@@ -9765,9 +9963,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
-            # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+            # Runtime/model switches must not race the active turn.
+            if _cmd_def_inner and _cmd_def_inner.name in {"model", "runtime"}:
+                noun = "runtime" if _cmd_def_inner.name == "runtime" else "models"
+                return f"Agent is running — wait or /stop first, then switch {noun}."
 
             # /codex-runtime must not be used while the agent is running.
             # Switching mid-turn would split a turn across two transports.
@@ -10003,6 +10202,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check for commands
         command = event.get_command()
 
+        # ── /hermes umbrella expansion ──────────────────────────────────
+        # The Slack adapter (plugins/platforms/slack/adapter.py) expands
+        # ``/hermes <subcommand> [args]`` into a canonical slash command
+        # before it ever reaches the generic dispatcher.  On every other
+        # platform (Telegram, Discord, API, webhook, etc.) a plain
+        # MessageEvent(text="/hermes runtime ncoder") arrives here with
+        # command="hermes" — which is NOT in GATEWAY_KNOWN_COMMANDS and
+        # would be rejected as "Unknown command".  Expand it here so the
+        # umbrella works uniformly across all platform gateways.
+        #
+        # Mirrors the subcommand-to-command mapping from Slack's adapter.
+        # This runs BEFORE the canonical-resolution / alias-expansion block
+        # below so the expanded command flows through all normal dispatch
+        # (hooks, access control, Level-2 handlers).
+        if command == "hermes":
+            _hermes_args = event.get_command_args().strip()
+            if not _hermes_args:
+                # Bare /hermes with no subcommand → /help (mirrors Slack)
+                event.text = "/help"
+                command = event.get_command()
+            else:
+                from hermes_cli.commands import slack_subcommand_map
+
+                _hermes_map = slack_subcommand_map()
+                _hermes_map["compact"] = "/compress"  # Slack adapter also adds this
+                _hermes_parts = _hermes_args.split(maxsplit=1)
+                _first = _hermes_parts[0]
+                if _first in _hermes_map:
+                    # Rewrite: /hermes runtime ncoder → /runtime ncoder
+                    _target = _hermes_map[_first]
+                    _rest = _hermes_parts[1] if len(_hermes_parts) > 1 else ""
+                    event.text = f"{_target} {_rest}".strip()
+                    command = event.get_command()
+                else:
+                    # Free-form question after /hermes — strip prefix and
+                    # treat as regular text (mirrors Slack adapter behaviour).
+                    from gateway.platforms.base import MessageType
+                    event.text = _hermes_args
+                    event.message_type = MessageType.TEXT
+                    command = None
+
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
             is_gateway_known_command,
@@ -10203,6 +10443,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical == "runtime":
+            return await self._handle_runtime_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
@@ -12074,6 +12317,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            # Preserve the platform user's actual turn separately from the
+            # model-facing message. _prepare_inbound_message_text enriches the
+            # latter with sender/reply/channel context for Hermes native, but an
+            # external conversation runtime must not persist those display
+            # annotations as the user's current instruction.
+            provider_user_message, provider_message_metadata = (
+                _north_provider_current_turn(event, source)
+            )
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -12104,6 +12355,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -16573,6 +16826,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
+            "agent_runtime": persisted.get("agent_runtime"),
         }
         provider = persisted.get("provider")
         if provider:
@@ -16798,8 +17052,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return
         running_agent = self._running_agents.get(session_key)
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            running_agent.interrupt(interrupt_reason)
+        # _interrupt_north_host interrupts both the Hermes host agent AND the
+        # North runtime in one call, avoiding the double interrupt that the
+        # previous inline running_agent.interrupt + runtime_from_raw /
+        # cancel_session_async sequence caused.  It handles None agent, missing
+        # runtime, and runtime_from_raw/load errors gracefully.
+        from gateway.north_coder_runtime import _interrupt_north_host
+
+        await _interrupt_north_host(running_agent, session_key, interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
@@ -17598,6 +17858,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        provider_user_message: Optional[str] = None,
+        provider_message_metadata: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -17616,6 +17878,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -17627,6 +17891,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                provider_user_message=provider_user_message,
+                provider_message_metadata=provider_message_metadata,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -17748,6 +18014,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        provider_user_message: Optional[str] = None,
+        provider_message_metadata: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17993,10 +18261,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # silent in chat. Handled before the progress_queue guard because
             # log mode runs without a chat progress queue.
             if log_queue is not None:
-                if event_type == "tool.started" and tool_name and tool_name != "_thinking":
+                north_start = _north_subagent_start_progress(
+                    event_type, tool_name, preview, **kwargs
+                )
+                if (event_type == "tool.started" and tool_name and tool_name != "_thinking") or north_start:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    preview_str = f' "{preview}"' if preview else ""
-                    log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+                    log_name, log_preview = north_start or (tool_name, preview)
+                    preview_str = f' "{log_preview}"' if log_preview else ""
+                    log_queue.put(f"{ts}  {log_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
             if not progress_queue or not _run_still_current():
@@ -18050,9 +18322,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not tool_progress_enabled:
                 return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in {"tool.started",}:
+            # North child starts use the same queue/formatting path as ordinary
+            # tool starts; child tool/complete events are intentionally quiet.
+            north_start = _north_subagent_start_progress(
+                event_type, tool_name, preview, **kwargs
+            )
+            if event_type != "tool.started" and not north_start:
                 return
+            if north_start:
+                tool_name, preview = north_start
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
@@ -19705,19 +19983,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                _north_runtime = None
+                _runtime_choice = str(
+                    (self._session_model_overrides.get(session_key or "") or {}).get("agent_runtime") or ""
+                ).strip().lower()
+                try:
+                    from gateway.north_coder_runtime import runtime_from_raw
+                    if _runtime_choice != "native":
+                        _north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+                except Exception:
+                    logger.exception("Failed to initialize North Coder runtime adapter")
+                if _runtime_choice == "ncoder" and _north_runtime is None:
+                    raise RuntimeError("This session is bound to ncoder, but North Coder runtime is not configured")
+                if _north_runtime is not None:
+                    def _north_event_sync(_event: dict[str, Any]) -> None:
+                        _forward_north_gateway_event(_event, progress_callback)
+                    result = asyncio.run(_north_runtime.run_turn(
+                        message=(
+                            provider_user_message
+                            if provider_user_message is not None
+                            else (_api_run_message if isinstance(_api_run_message, str) else message)
+                        ),
+                        session_key=session_key or session_id,
+                        hermes_session_id=session_id,
+                        context_prompt=combined_ephemeral,
+                        source=source,
+                        conversation_history=agent_history,
+                        # Messaging Gateway has no user-selected project cwd by
+                        # default. Never leak launchd's infrastructure cwd
+                        # (~/.hermes) into North's project registry; bind the
+                        # conversation to North's configured default workspace.
+                        workdir=None,
+                        workspace_id=_north_runtime.config.workspace_id,
+                        event_message_id=event_message_id,
+                        on_delta=_stream_delta_cb,
+                        on_event=_north_event_sync,
+                        metadata_extra=provider_message_metadata,
+                    ))
+                else:
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
                 try:
-                    from tools.clarify_gateway import clear_session as _clear_clarify_session
-                    _clear_clarify_session(_approval_session_key)
+                    _keep_north_ask_user = bool(
+                        isinstance(locals().get("result"), dict)
+                        and locals()["result"].get("requires_action")
+                        and ((locals()["result"].get("required_action") or {}).get("type") == "ask_user")
+                    )
+                    if not _keep_north_ask_user:
+                        from tools.clarify_gateway import clear_session as _clear_clarify_session
+                        _clear_clarify_session(_approval_session_key)
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            if result.get("requires_action") and _north_runtime is not None:
+                try:
+                    from tools import north_actions
+                    _required = result.get("required_action") or {}
+                    _action_id = _required.get("action_id") or _required.get("tool_call_id")
+                    if _action_id:
+                        north_actions.register(session_key or session_id, {
+                            "kind": "ask_user" if (_required.get("type") or _required.get("action_type")) == "ask_user" else ("permission" if (_required.get("type") or _required.get("action_type")) in {"permission_request", "permission"} else "action"),
+                            "invocation_id": result.get("north_invocation_id") or _north_runtime.active_invocation(session_key or session_id),
+                            "tool_call_id": _action_id,
+                            "required_action": _required,
+                            "runtime": _north_runtime,
+                            "hermes_session_id": session_id,
+                            "context_prompt": combined_ephemeral,
+                            "source": source,
+                            "event_message_id": event_message_id,
+                        })
+                        if (_required.get("type") or _required.get("action_type")) == "ask_user":
+                            from tools import clarify_gateway
+                            _requests = _required.get("pending_requests") or _required.get("questions") or []
+                            _first = _requests[0] if isinstance(_requests, list) and _requests else _required
+                            _question = str(_first.get("prompt") or _first.get("question") or "North Coder is asking for more information.") if isinstance(_first, dict) else str(_first)
+                            _choices = _first.get("options") or _first.get("choices") if isinstance(_first, dict) else None
+                            clarify_gateway.register(
+                                f"north:{_action_id}",
+                                session_key or session_id,
+                                _question,
+                                [str(item.get("label") if isinstance(item, dict) else item) for item in _choices] if _choices else None,
+                            )
+                except Exception:
+                    logger.exception("Failed to register North pending action")
             result_holder[0] = result
+            # Schedule background review after successful North foreground turn.
+            if _north_runtime is not None:
+                try:
+                    _schedule_north_review_after_turn(
+                        agent_history=agent_history,
+                        result=result,
+                        session_id=session_id,
+                        session_key=session_key,
+                        review_host=agent,
+                        background_review_callback=_bg_review_send,
+                        memory_notifications=getattr(agent, "memory_notifications", "on"),
+                    )
+                except Exception:
+                    logger.exception("North background review scheduling failed")
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
@@ -19866,6 +20233,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "requires_action": result.get("requires_action", False),
+                    "required_action": result.get("required_action"),
+                    "status": result.get("status"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -19982,6 +20352,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "requires_action": result.get("requires_action", False),
+                "required_action": result.get("required_action"),
+                "status": result.get("status"),
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
@@ -20131,7 +20504,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
-                            agent.interrupt(pending_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                agent, session_key, str(pending_text or "")
+                            )
                             _interrupt_detected.set()
                             break
                 except asyncio.CancelledError:
@@ -20318,7 +20695,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                _backup_agent, session_key, str(_bp_text or "")
+                            )
                             _interrupt_detected.set()
             else:
                 # Poll loop: check the agent's built-in activity tracker
@@ -20378,7 +20759,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            from gateway.north_coder_runtime import _interrupt_north_host
+
+                            await _interrupt_north_host(
+                                _backup_agent, session_key, str(_bp_text or "")
+                            )
                             _interrupt_detected.set()
 
             if _inactivity_timeout:
@@ -20408,7 +20793,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                    from gateway.north_coder_runtime import _interrupt_north_host
+
+                    await _interrupt_north_host(
+                        _timed_out_agent,
+                        session_key,
+                        str(_INTERRUPT_REASON_TIMEOUT),
+                    )
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
@@ -20769,6 +21160,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    provider_user_message=(
+                        _north_provider_current_turn(pending_event, next_source)[0]
+                        if pending_event is not None
+                        else pending
+                    ),
+                    provider_message_metadata=(
+                        _north_provider_current_turn(pending_event, next_source)[1]
+                        if pending_event is not None
+                        else None
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

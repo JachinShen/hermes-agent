@@ -1068,6 +1068,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # This is never exposed to the model -- only infrastructure code calls it.
 # Thread-safe because each task_id is unique per rollout.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
+_task_env_overrides_lock = threading.RLock()
 
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
@@ -1122,6 +1123,84 @@ def clear_session_cwd(session_key: str) -> None:
         _session_cwd.pop(session_key, None)
 
 
+def snapshot_task_env_overrides(task_id: str) -> Dict[str, Any]:
+    """Copy the real registry entry without exposing mutable state."""
+    with _task_env_overrides_lock:
+        return dict(_task_env_overrides.get(str(task_id), {}))
+
+
+def snapshot_task_cwd_state(task_id: str) -> Dict[str, Any]:
+    """Snapshot the three independent cwd holders for an exact workspace rollback.
+
+    ``snapshot_task_env_overrides`` intentionally remains a registry-only,
+    backwards-compatible API.  Workspace switching needs the registry cwd,
+    per-session record, and live environment cwd separately because they can
+    legitimately differ while a switch is in flight.
+    """
+    key = str(task_id)
+    with _task_env_overrides_lock:
+        overrides = dict(_task_env_overrides.get(key, {}))
+        registry_present = "cwd" in overrides
+        registry_value = overrides.get("cwd")
+    with _session_cwd_lock:
+        session_present = key in _session_cwd
+        session_value = _session_cwd.get(key)
+    container_id = _resolve_container_task_id(key)
+    with _env_lock:
+        env = _active_environments.get(key) or _active_environments.get(container_id)
+        env_present = env is not None
+        env_cwd_present = env_present and hasattr(env, "cwd")
+        env_value = getattr(env, "cwd", None) if env_cwd_present else None
+    return {
+        "registry": {"present": registry_present, "value": registry_value},
+        "session": {"present": session_present, "value": session_value},
+        "env": {
+            "present": env_present,
+            "cwd_present": env_cwd_present,
+            "cwd": env_value,
+        },
+    }
+
+
+def restore_task_cwd(task_id: str, snapshot: Dict[str, Any]) -> None:
+    """Restore each cwd holder exactly, preserving non-cwd overrides."""
+    key = str(task_id)
+    # Accept the old registry-only shape for callers that used the early API.
+    if "registry" not in snapshot:
+        legacy_present = "cwd" in snapshot
+        snapshot = {
+            "registry": {"present": legacy_present, "value": snapshot.get("cwd")},
+            "session": {"present": legacy_present, "value": snapshot.get("cwd")},
+            "env": {"present": True, "cwd_present": legacy_present, "cwd": snapshot.get("cwd")},
+        }
+    registry = snapshot.get("registry") or {}
+    with _task_env_overrides_lock:
+        current = dict(_task_env_overrides.get(key, {}))
+        if registry.get("present"):
+            current["cwd"] = registry.get("value")
+        else:
+            current.pop("cwd", None)
+        if current:
+            _task_env_overrides[key] = current
+        else:
+            _task_env_overrides.pop(key, None)
+
+    # Do not hold the registry lock while taking the environment lock.  This
+    # matches register_task_env_overrides and avoids registry/env lock inversion.
+    session = snapshot.get("session") or {}
+    with _session_cwd_lock:
+        if session.get("present"):
+            _session_cwd[key] = session.get("value")
+        else:
+            _session_cwd.pop(key, None)
+    container_id = _resolve_container_task_id(key)
+    with _env_lock:
+        env = _active_environments.get(key) or _active_environments.get(container_id)
+        env_snapshot = snapshot.get("env") or {}
+        if env is not None and env_snapshot.get("cwd_present"):
+            env.cwd = env_snapshot.get("cwd")
+
+
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
     Register environment overrides for a specific task/rollout.
@@ -1138,7 +1217,10 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    with _task_env_overrides_lock:
+        merged = dict(_task_env_overrides.get(str(task_id), {}))
+        merged.update(overrides)
+        _task_env_overrides[str(task_id)] = merged
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1168,7 +1250,8 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    with _task_env_overrides_lock:
+        _task_env_overrides.pop(str(task_id), None)
     clear_session_cwd(task_id)
 
 
@@ -1200,9 +1283,10 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
-        if set(overrides.keys()) & _ISOLATION_KEYS:
+    if task_id:
+        with _task_env_overrides_lock:
+            overrides = _task_env_overrides.get(task_id)
+        if overrides is not None and set(overrides.keys()) & _ISOLATION_KEYS:
             return task_id
     return "default"
 
@@ -1220,11 +1304,12 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     source of that lookup so the terminal and file layers can't drift apart.
     """
     raw = task_id or "default"
-    return (
-        _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
-        or {}
-    )
+    with _task_env_overrides_lock:
+        return dict(
+            _task_env_overrides.get(raw)
+            or _task_env_overrides.get(_resolve_container_task_id(raw))
+            or {}
+        )
 
 
 # Configuration from environment variables

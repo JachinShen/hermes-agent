@@ -2097,6 +2097,42 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_runtime_command(self, event: MessageEvent) -> str:
+        """Show or change the runtime binding for exactly one Gateway session."""
+        from gateway.north_coder_runtime import runtime_from_raw
+        from gateway.run import _gateway_config_home, _load_gateway_config
+
+        target = (event.get_command_args() or "").strip().lower()
+        if target and target not in {"native", "ncoder"}:
+            return "Usage: /runtime [native|ncoder]"
+
+        session_key = self._session_key_for_source(event.source)
+        self._rehydrate_session_model_override(session_key)
+        existing = dict(self._session_model_overrides.get(session_key) or {})
+        north_runtime = runtime_from_raw(_load_gateway_config(), _gateway_config_home())
+        current = str(existing.get("agent_runtime") or ("ncoder" if north_runtime else "native"))
+        if not target:
+            return f"Agent runtime for this session: {current}"
+        if target == "ncoder" and north_runtime is None:
+            return "North Coder runtime is not configured."
+        if target == current:
+            return f"Agent runtime already: {target}"
+
+        existing["agent_runtime"] = target
+        self._session_model_overrides[session_key] = existing
+        try:
+            await self.async_session_store.set_model_override(session_key, existing)
+        except Exception:
+            logger.debug("Failed to persist session runtime override", exc_info=True)
+
+        # A provider conversation is disposable execution state. Detach it on
+        # either direction so returning to North seeds the canonical Gateway
+        # transcript rather than reviving a stale private history.
+        if north_runtime is not None:
+            north_runtime.detach_session(session_key)
+        self._evict_cached_agent(session_key)
+        return f"Switched agent runtime for this session: {target}"
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 
@@ -4567,27 +4603,35 @@ class GatewaySlashCommandsMixin:
         return "\n".join(lines)
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /approve command — unblock waiting agent thread(s).
-
-        The agent thread(s) are blocked inside tools/approval.py waiting for
-        the user to respond.  This handler signals the event so the agent
-        resumes and the terminal_tool executes the command inline — the same
-        flow as the CLI's synchronous input() approval.
-
-        Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
-
-        Usage:
-            /approve              — approve oldest pending command once
-            /approve all          — approve ALL pending commands at once
-            /approve session      — approve oldest + remember for session
-            /approve all session  — approve all + remember for session
-            /approve always       — approve oldest + remember permanently
-            /approve all always   — approve all + remember permanently
-        """
+        """Handle /approve for Hermes approvals and North permission pauses."""
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        # North permission pauses use the same user-facing /approve command,
+        # but resolve the North invocation instead of Hermes' local queue.
+        try:
+            from tools import north_actions
+            _north_action = north_actions.get(session_key)
+        except Exception:
+            _north_action = None
+        if _north_action and _north_action.get("kind") == "permission":
+            args = event.get_command_args().strip().lower().split()
+            remaining = [a for a in args if a != "all"]
+            decision = "allow" if any(a in {"session", "ses", "always", "permanent", "permanently"} for a in remaining) else "allow_once"
+            try:
+                await _north_action["runtime"].resolve_permission(
+                    str(_north_action["invocation_id"]),
+                    str(_north_action["tool_call_id"]),
+                    decision,
+                )
+                north_actions.pop(session_key)
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _adapter.resume_typing_for_chat(source.chat_id)
+                return f"North permission resolved: {decision}."
+            except Exception as exc:
+                logger.exception("Failed to resolve North permission via /approve")
+                return f"North permission resolve failed: {exc}"
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -4637,6 +4681,27 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        try:
+            from tools import north_actions
+            _north_action = north_actions.get(session_key)
+        except Exception:
+            _north_action = None
+        if _north_action and _north_action.get("kind") == "permission":
+            try:
+                await _north_action["runtime"].resolve_permission(
+                    str(_north_action["invocation_id"]),
+                    str(_north_action["tool_call_id"]),
+                    "deny",
+                )
+                north_actions.pop(session_key)
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _adapter.resume_typing_for_chat(source.chat_id)
+                return "North permission denied."
+            except Exception as exc:
+                logger.exception("Failed to deny North permission via /deny")
+                return f"North permission resolve failed: {exc}"
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,

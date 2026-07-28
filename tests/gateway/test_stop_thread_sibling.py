@@ -9,6 +9,7 @@ stop any run in the same thread.
 """
 
 import pytest
+from unittest.mock import patch
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
@@ -16,7 +17,11 @@ from gateway.platforms.base import Platform, MessageEvent, MessageType
 
 
 class _FakeAgent:
-    pass
+    def __init__(self):
+        self.interrupts = []
+
+    def interrupt(self, reason):
+        self.interrupts.append(reason)
 
 
 def _thread_source(uid, thread_id="thr1", chat_id="chan1"):
@@ -92,6 +97,41 @@ def test_sibling_returns_empty_for_non_thread_source():
 # ---------------------------------------------------------------------------
 # _handle_stop_command fallback path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interrupt_and_clear_session_cancels_matching_north_invocation():
+    runner = object.__new__(GatewayRunner)
+    source = _thread_source("userA")
+    key = _per_user_key("userA")
+    agent = _FakeAgent()
+    runner._running_agents = {key: agent}
+    runner._pending_messages = {}
+    runner._adapter_for_source = lambda _source: None
+    runner._invalidate_session_run_generation = lambda *_args, **_kwargs: None
+    runner._release_running_agent_state = lambda _key: None
+    runner._evict_cached_agent = lambda _key: None
+
+    cancelled = []
+
+    class _NorthRuntime:
+        async def cancel_session_async(self, session_key):
+            cancelled.append(session_key)
+
+    with patch(
+        "gateway.north_coder_runtime.runtime_from_raw", return_value=_NorthRuntime()
+    ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+        "gateway.run._gateway_config_home"
+    ):
+        await runner._interrupt_and_clear_session(
+            key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="test_stop_north",
+        )
+
+    assert agent.interrupts == [_INTERRUPT_REASON_STOP]
+    assert cancelled == [key]
 
 
 class _StoreEntry:

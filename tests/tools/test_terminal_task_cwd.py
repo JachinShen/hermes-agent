@@ -211,10 +211,81 @@ def test_registering_cwd_override_noop_when_no_live_env(monkeypatch):
     assert terminal_tool._task_env_overrides["acp-session-pending"] == {"cwd": "/workspace/new"}
 
 
-def test_registering_non_cwd_override_leaves_live_env_cwd_untouched(monkeypatch):
-    """A non-cwd override (e.g. a per-task Modal image) must not disturb the
-    live env's cwd."""
+def test_restore_task_cwd_restores_registry_session_and_live_env(monkeypatch):
+    class FakeEnv:
+        cwd = "/workspace/new"
 
+    task_id = "restore-session"
+    fake_env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {
+        task_id: {"cwd": "/workspace/new", "modal_image": "keep"}
+    })
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {task_id: "/workspace/new"})
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+
+    terminal_tool.restore_task_cwd(
+        task_id,
+        {"cwd": "/workspace/old", "modal_image": "keep"},
+    )
+
+    assert terminal_tool._task_env_overrides[task_id] == {
+        "cwd": "/workspace/old", "modal_image": "keep"
+    }
+    assert terminal_tool.get_session_cwd(task_id) == "/workspace/old"
+    assert fake_env.cwd == "/workspace/old"
+
+
+def test_cwd_snapshot_restores_three_layers_and_preserves_other_overrides(monkeypatch):
+    class FakeEnv:
+        cwd = "/live-before"
+
+    task_id = "three-layer"
+    fake_env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {
+        task_id: {"cwd": "/registry-before", "modal_image": "keep"}
+    })
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {task_id: "/session-before"})
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+
+    snapshot = terminal_tool.snapshot_task_cwd_state(task_id)
+    terminal_tool._task_env_overrides[task_id]["cwd"] = "/registry-after"
+    terminal_tool._session_cwd[task_id] = "/session-after"
+    fake_env.cwd = "/live-after"
+    terminal_tool.restore_task_cwd(task_id, snapshot)
+
+    assert terminal_tool._task_env_overrides[task_id] == {
+        "cwd": "/registry-before", "modal_image": "keep"
+    }
+    assert terminal_tool.get_session_cwd(task_id) == "/session-before"
+    assert fake_env.cwd == "/live-before"
+
+
+def test_cwd_snapshot_restores_absence_in_registry_and_session(monkeypatch):
+    class FakeEnv:
+        cwd = "/live-before"
+
+    task_id = "absent-cwd"
+    fake_env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"modal_image": "keep"}})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+
+    snapshot = terminal_tool.snapshot_task_cwd_state(task_id)
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": "/new"})
+    terminal_tool.record_session_cwd(task_id, "/new")
+    fake_env.cwd = "/new"
+    terminal_tool.restore_task_cwd(task_id, snapshot)
+
+    assert terminal_tool._task_env_overrides[task_id] == {"modal_image": "keep"}
+    assert terminal_tool.get_session_cwd(task_id) is None
+    assert fake_env.cwd == "/live-before"
+
+
+def test_registering_non_cwd_override_leaves_live_env_cwd_untouched(monkeypatch):
+    """A non-cwd override must not disturb the live env's cwd."""
     class FakeEnv:
         env = {}
         cwd = "/workspace/keep"

@@ -15,6 +15,8 @@ Covers:
   - api_key is NEVER serialized to sessions.json
 """
 import json
+import types
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -232,3 +234,76 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+    assert sanitize_model_override({"agent_runtime": "NCODER"}) == {
+        "agent_runtime": "ncoder"
+    }
+    assert sanitize_model_override({"agent_runtime": "unknown"}) is None
+
+
+def test_runtime_binding_is_persisted_and_isolated_per_session(store_factory):
+    store = store_factory()
+    first = store.get_or_create_session(_make_source())
+    second = store.get_or_create_session(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="u1",
+            chat_id="c2",
+            user_name="tester",
+            chat_type="dm",
+        )
+    )
+
+    store.set_model_override(first.session_key, {"agent_runtime": "native"})
+    store.set_model_override(second.session_key, {"agent_runtime": "ncoder"})
+
+    restarted = store_factory()
+    assert restarted.get_model_override(first.session_key) == {"agent_runtime": "native"}
+    assert restarted.get_model_override(second.session_key) == {"agent_runtime": "ncoder"}
+
+    runner = _make_runner(restarted)
+    runner._rehydrate_session_model_override(first.session_key)
+    runner._rehydrate_session_model_override(second.session_key)
+    assert runner._session_model_overrides[first.session_key]["agent_runtime"] == "native"
+    assert runner._session_model_overrides[second.session_key]["agent_runtime"] == "ncoder"
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_command_changes_only_current_session(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    persisted = []
+    detached = []
+    evicted = []
+
+    class AsyncStore:
+        def __init__(self, store):
+            self._store = store
+
+        async def set_model_override(self, session_key, value):
+            persisted.append((session_key, dict(value)))
+
+    runtime = types.SimpleNamespace(detach_session=lambda key: detached.append(key))
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {"session-b": {"agent_runtime": "ncoder"}}
+    monkeypatch.setattr(runner, "_session_key_for_source", lambda source: "session-a")
+    monkeypatch.setattr(runner, "_rehydrate_session_model_override", lambda session_key: None)
+    monkeypatch.setattr(runner, "_evict_cached_agent", lambda session_key: evicted.append(session_key))
+    store_marker = object()
+    cast(Any, runner).session_store = store_marker
+    cast(Any, runner)._async_session_store = AsyncStore(store_marker)
+    event = types.SimpleNamespace(
+        source=object(),
+        get_command_args=lambda: "native",
+    )
+
+    with patch("gateway.north_coder_runtime.runtime_from_raw", return_value=runtime), patch(
+        "gateway.run._load_gateway_config", return_value={}
+    ), patch("gateway.run._gateway_config_home"):
+        result = await runner._handle_runtime_command(cast(Any, event))
+
+    assert result == "Switched agent runtime for this session: native"
+    assert runner._session_model_overrides["session-a"] == {"agent_runtime": "native"}
+    assert runner._session_model_overrides["session-b"] == {"agent_runtime": "ncoder"}
+    assert persisted == [("session-a", {"agent_runtime": "native"})]
+    assert detached == ["session-a"]
+    assert evicted == ["session-a"]

@@ -1014,6 +1014,49 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().subagents.find(s => s.id === 'sa-error')?.status).toBe('error')
   })
 
+  it('keeps North child tools and aggregate progress in the renderable subagent node', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: { goal: 'inspect files', subagent_id: 'north-child-1', task_index: 0 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: {
+        subagent_id: 'north-child-1',
+        tool_count: 1,
+        tool_name: 'read_file',
+        tool_preview: 'pyproject.toml'
+      },
+      type: 'subagent.tool'
+    } as any)
+    onEvent({
+      payload: {
+        subagent_id: 'north-child-1',
+        tool_count: 2,
+        tool_name: 'list_directory',
+        tool_preview: '.'
+      },
+      type: 'subagent.tool'
+    } as any)
+    onEvent({
+      payload: { subagent_id: 'north-child-1', text: '2 tools completed', tool_count: 2 },
+      type: 'subagent.progress'
+    } as any)
+    onEvent({
+      payload: { status: 'completed', subagent_id: 'north-child-1', summary: 'inspection complete' },
+      type: 'subagent.complete'
+    } as any)
+
+    const child = getTurnState().subagents.find(s => s.id === 'north-child-1')
+    expect(child).toMatchObject({ status: 'completed', summary: 'inspection complete', toolCount: 2 })
+    expect(child?.tools.join('\n')).toContain('Read File')
+    expect(child?.tools.join('\n')).toContain('List Directory')
+    expect(child?.notes).toContain('2 tools completed')
+  })
+
   it('normalizes unknown subagent.complete statuses to completed', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

@@ -276,18 +276,55 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    restored = 0
+    unroutable = 0
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, origin_session, origin_ui_session_id, event_json
+               FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        for delegation_id, origin_session, origin_ui_session_id, payload in rows:
             evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
+            if not isinstance(evt, dict):
+                continue
+
+            # Older payloads may predate routing fields in event_json even
+            # though the normalized durable columns have them. Repair the
+            # in-memory event from those columns before publishing it.
+            session_key = str(evt.get("session_key") or origin_session or "")
+            origin_ui = str(
+                evt.get("origin_ui_session_id") or origin_ui_session_id or ""
+            )
+            evt["session_key"] = session_key
+            evt["origin_ui_session_id"] = origin_ui
+
+            if not session_key and not origin_ui:
+                # Legacy cron/stateless-CLI delegations had no return address.
+                # No current or future consumer can positively own them, so
+                # leaving them pending causes every process start to enqueue,
+                # warn, drop, and replay the same payload forever. Acknowledge
+                # these terminally while preserving their durable result row.
+                now = time.time()
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET delivery_state='delivered', delivered_at=?, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (now, now, delegation_id),
+                )
+                unroutable += 1
+                continue
+
+            evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    if unroutable:
+        logger.info(
+            "Acknowledged %d legacy async delegation completion(s) with no return address",
+            unroutable,
+        )
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
